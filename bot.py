@@ -202,9 +202,8 @@ async def require_verification(interaction):
             ephemeral=True,
         )
         return False
-
-    if not BLOXLINK_API_KEY or not BLOXLINK_VERIFIED_ROLE_ID:
-       await interaction.followup.send(
+  if not BLOXLINK_API_KEY or not BLOXLINK_VERIFIED_ROLE_ID:
+        await interaction.followup.send(
             "Bloxlink verification is not configured correctly. "
             "Please contact server staff.",
             ephemeral=True,
