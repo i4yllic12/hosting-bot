@@ -698,7 +698,14 @@ async def on_message(message):
             return
 
         pending_results.pop(key, None)
-        await message.add_reaction("✅")
+              pending_results.pop(key, None)
+
+        # Delete the original screenshot from the host channel.
+        try:
+            await message.delete()
+        except discord.HTTPException as error:
+            print(f"Could not delete original screenshot message: {error!r}")
+
         await refresh_match(message.guild, match_id)
         await message.reply(
             f"Screenshot and results posted in {results_channel.mention}.",
