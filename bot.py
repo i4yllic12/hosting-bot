@@ -657,6 +657,7 @@ async def on_message(message):
 
 # ---------------- SLASH COMMANDS ----------------
 
+
 @bot.tree.command(name="host", description="Create a match.")
 @app_commands.describe(
     mode="Match format",
@@ -682,54 +683,66 @@ async def host(
     region: app_commands.Choice[str],
     link: str = "",
 ):
-    if not interaction.guild or not isinstance(
-        interaction.user, discord.Member
-    ):
-        await interaction.response.send_message(
-            "Use this command inside the server.", ephemeral=True
+    # Respond to Discord immediately so the interaction doesn't time out.
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        if not interaction.guild or not isinstance(
+            interaction.user, discord.Member
+        ):
+            await interaction.followup.send(
+                "Use this command inside the server.", ephemeral=True
+            )
+            return
+
+        if not has_host_role(interaction.user):
+            await interaction.followup.send(
+                "You need the Host role to use /host.", ephemeral=True
+            )
+            return
+
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.followup.send(
+                "Use /host in a text channel.", ephemeral=True
+            )
+            return
+
+        if link and not (
+            link.startswith("https://")
+            and "roblox.com" in link.lower()
+        ):
+            await interaction.followup.send(
+                "Please provide a valid HTTPS Roblox private-server link.",
+                ephemeral=True,
+            )
+            return
+
+        if not await require_verification(interaction):
+            return
+
+        match_id = create_match(
+            guild_id=interaction.guild.id,
+            channel_id=interaction.channel.id,
+            host_id=interaction.user.id,
+            mode=mode.value,
+            region=region.value,
+            private_server_link=link,
         )
-        return
 
-    if not has_host_role(interaction.user):
-        await interaction.response.send_message(
-            "You need the Host role to use /host.", ephemeral=True
+        await send_match(interaction.guild, match_id)
+
+        await interaction.followup.send(
+            "Your match has been posted.", ephemeral=True
         )
-        return
 
-    if not await require_verification(interaction):
-        return
+    except Exception as error:
+        print(f"/host command failed: {error!r}")
 
-    if link and not (
-        link.startswith("https://")
-        and "roblox.com" in link.lower()
-    ):
-        await interaction.response.send_message(
-            "Please provide a valid HTTPS Roblox private-server link.",
+        await interaction.followup.send(
+            "Something went wrong while creating your match. "
+            "Please try again later or contact server staff.",
             ephemeral=True,
         )
-        return
-
-    if not isinstance(interaction.channel, discord.TextChannel):
-        await interaction.response.send_message(
-            "Use /host in a text channel.", ephemeral=True
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    match_id = create_match(
-        guild_id=interaction.guild.id,
-        channel_id=interaction.channel.id,
-        host_id=interaction.user.id,
-        mode=mode.value,
-        region=region.value,
-        private_server_link=link,
-    )
-
-    await send_match(interaction.guild, match_id)
-    await interaction.followup.send(
-        "Your match has been posted.", ephemeral=True
-    )
 
 
 @bot.tree.command(name="hostinghelp", description="Hosting bot help.")
