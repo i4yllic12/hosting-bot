@@ -207,9 +207,9 @@ async def get_roblox_username(member):
                 roblox_data = await response.json()
                 return roblox_data.get("name")
 
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
-        print(f"Bloxlink/Roblox lookup failed: {error}")
-        return None
+    except Exception as error:
+    print(f"Bloxlink/Roblox lookup failed: {type(error).__name__}: {error!r}")
+    return None
 
 
 async def require_verification(interaction):
