@@ -418,11 +418,12 @@ class MatchView(discord.ui.View):
                 url=match["private_server_link"],
             )
             self.add_item(link_button)
-    @discord.ui.button(
+            @discord.ui.button(
         label="Cancel Host",
         style=discord.ButtonStyle.danger,
         emoji="🛑",
         row=2,
+        custom_id="hosting:cancel_host",
     )
     async def cancel_host(
         self,
