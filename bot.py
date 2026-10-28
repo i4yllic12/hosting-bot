@@ -428,7 +428,7 @@ class MatchView(discord.ui.View):
         )
         cancel.callback = self.cancel_host
         self.add_item(cancel)
-    )
+    
     async def cancel_host(
         self,
         interaction: discord.Interaction,
