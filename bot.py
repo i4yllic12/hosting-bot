@@ -188,21 +188,16 @@ async def get_roblox_username(member):
         print(f"Bloxlink/Roblox lookup failed: {error}")
         return None
 
+
 async def require_verification(interaction):
     if not isinstance(interaction.user, discord.Member):
         await interaction.followup.send(
-            "Use this feature inside the server.", ephemeral=True
-        )
-        return False
-    if not is_bloxlink_verified(interaction.user):
-        await interaction.followup.send(
-            "You must verify with Bloxlink and receive the server's "
-            "verified role before hosting or joining. Use Bloxlink's "
-            "verification instructions, then try again.",
+            "Use this feature inside the server.",
             ephemeral=True,
         )
         return False
-  if not BLOXLINK_API_KEY or not BLOXLINK_VERIFIED_ROLE_ID:
+
+    if not BLOXLINK_API_KEY or not BLOXLINK_VERIFIED_ROLE_ID:
         await interaction.followup.send(
             "Bloxlink verification is not configured correctly. "
             "Please contact server staff.",
@@ -210,11 +205,22 @@ async def require_verification(interaction):
         )
         return False
 
+    if not any(
+        role.id == int(BLOXLINK_VERIFIED_ROLE_ID)
+        for role in interaction.user.roles
+    ):
+        await interaction.followup.send(
+            "You must verify with Bloxlink and receive the server's "
+            "verified role before hosting or joining.",
+            ephemeral=True,
+        )
+        return False
+
     username = await get_roblox_username(interaction.user)
     if not username:
-       await interaction.followup.send(
-            "I couldn't retrieve your linked Roblox username from "
-            "Bloxlink. Check your verification and try again later.",
+        await interaction.followup.send(
+            "I couldn't retrieve your Roblox username from Bloxlink. "
+            "Please try again shortly.",
             ephemeral=True,
         )
         return False
