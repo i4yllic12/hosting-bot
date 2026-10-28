@@ -425,7 +425,7 @@ class MatchView(discord.ui.View):
         emoji="🛑",
         row=2,
     )
- class MatchView(discord.ui.View):
+class MatchView(discord.ui.View):
         self,
         interaction: discord.Interaction,
         button: discord.ui.Button,
