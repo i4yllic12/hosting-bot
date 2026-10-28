@@ -275,7 +275,7 @@ def make_match_embed(match):
             player_id = players[index]
             member = None
 
-            if match.get("guild_id"):
+            if "guild_id" in match.keys():
                 guild = bot.get_guild(match["guild_id"])
                 if guild:
                     member = guild.get_member(player_id)
