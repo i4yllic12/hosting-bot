@@ -451,17 +451,20 @@ class MatchView(discord.ui.View):
             "You left the match.", ephemeral=True
         )
 
-    async def post_results(self, interaction):
+      async def post_results(self, interaction):
         match = get_match(self.match_id)
+
         if not match:
             await interaction.response.send_message(
-                "This match could not be found.", ephemeral=True
+                "This match could not be found.",
+                ephemeral=True,
             )
             return
 
         if match["status"] == "completed":
             await interaction.response.send_message(
-                "This match already has results.", ephemeral=True
+                "This match already has results.",
+                ephemeral=True,
             )
             return
 
@@ -474,15 +477,19 @@ class MatchView(discord.ui.View):
 
         if not isinstance(interaction.channel, discord.TextChannel):
             await interaction.response.send_message(
-                "Use this button in the hosting channel.", ephemeral=True
+                "Use this button in the hosting channel.",
+                ephemeral=True,
             )
             return
 
         pending_results[(interaction.channel.id, interaction.user.id)] = (
             self.match_id
         )
+
         await interaction.response.send_message(
-            "Type the match result as your next message in this channel.",
+            "📸 **Screenshot required!** Send your next message in this "
+            "channel with a screenshot of the match results attached. "
+            "Messages without an image won't be accepted.",
             ephemeral=True,
         )
 
@@ -615,9 +622,6 @@ async def on_message(message):
 
     if match_id is not None:
         match = get_match(match_id)
-        if not message.content.strip():
-            await message.reply("Please type the result.", mention_author=False)
-            return
 
         if not match or match["status"] != "open":
             pending_results.pop(key, None)
@@ -625,6 +629,7 @@ async def on_message(message):
                 "This match is no longer open for results.",
                 mention_author=False,
             )
+            await bot.process_commands(message)
             return
 
         if not can_manage_message(message, match):
@@ -633,42 +638,76 @@ async def on_message(message):
                 "You are not authorized to post these results.",
                 mention_author=False,
             )
+            await bot.process_commands(message)
+            return
+
+        # Require an image attachment.
+        screenshot = next(
+            (
+                attachment
+                for attachment in message.attachments
+                if attachment.content_type
+                and attachment.content_type.startswith("image/")
+            ),
+            None,
+        )
+
+        if screenshot is None:
+            await message.reply(
+                "📸 Please attach a screenshot of the match results. "
+                "Your results have not been submitted yet.",
+                mention_author=False,
+            )
+            await bot.process_commands(message)
             return
 
         results_channel = await find_results_channel(message.guild)
+
         if results_channel is None:
             await message.reply(
-                "I couldn't find #match-results. Check its ID in FadeHost.",
+                "I couldn't find #match-results. Check its channel ID.",
                 mention_author=False,
             )
+            await bot.process_commands(message)
             return
 
-        result_text = message.content.strip()
+        result_text = message.content.strip() or "Screenshot submitted."
         update_match(match_id, status="completed", result=result_text)
         completed = get_match(match_id)
 
         try:
             await results_channel.send(
-                embed=make_match_embed(completed)
+                content=(
+                    f"📸 **Match screenshot submitted by "
+                    f"{message.author.mention}**"
+                ),
+                embed=make_match_embed(completed),
+                files=[
+                    await screenshot.to_file(
+                        filename=screenshot.filename
+                    )
+                ],
             )
-        except discord.HTTPException:
+        except (discord.HTTPException, OSError) as error:
+            print(f"Could not post match screenshot: {error!r}")
             update_match(match_id, status="open", result="")
             await message.reply(
-                "I couldn't post the results. Check my channel permissions.",
+                "I couldn't post the screenshot. Check my permissions "
+                "in #match-results and try again.",
                 mention_author=False,
             )
+            await bot.process_commands(message)
             return
 
         pending_results.pop(key, None)
         await message.add_reaction("✅")
         await refresh_match(message.guild, match_id)
         await message.reply(
-            f"Results posted in {results_channel.mention}.",
+            f"Screenshot and results posted in {results_channel.mention}.",
             mention_author=False,
         )
 
     await bot.process_commands(message)
-
 
 # ---------------- SLASH COMMANDS ----------------
 
