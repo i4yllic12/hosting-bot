@@ -157,6 +157,7 @@ def is_bloxlink_verified(member):
 
 
 
+
 async def get_roblox_username(member):
     timeout = aiohttp.ClientTimeout(total=15)
 
@@ -172,20 +173,13 @@ async def get_roblox_username(member):
                 headers={"Authorization": BLOXLINK_API_KEY},
             ) as response:
                 body = await response.text()
-
                 print(f"Bloxlink status: {response.status}")
                 print(f"Bloxlink response: {body[:500]}")
 
                 if response.status != 200:
                     return None
 
-                try:
-                    data = await response.json(
-                        content_type=None
-                    )
-                except ValueError:
-                    print("Bloxlink returned invalid JSON.")
-                    return None
+                data = await response.json(content_type=None)
 
             roblox_id = (
                 data.get("robloxID")
@@ -207,12 +201,13 @@ async def get_roblox_username(member):
                 roblox_data = await response.json()
                 return roblox_data.get("name")
 
-      except Exception as error:
+    except Exception as error:
         print(
             f"Bloxlink/Roblox lookup failed: "
             f"{type(error).__name__}: {error!r}"
         )
         return None
+
 
 
 async def require_verification(interaction):
