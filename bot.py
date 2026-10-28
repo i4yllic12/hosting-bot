@@ -31,6 +31,16 @@ SLOT_COUNTS = {"1v1s": 2, "2v2s": 4, "3v3s": 6}
 
 pending_results = {}
 
+ROLE_1V1_ID = 1564896767257084036  # Replace with your actual 1v1s role ID
+ROLE_2V2_ID = 1564896807673270382  # Replace with your actual 2v2s role ID
+ROLE_3V3_ID = 1564896826723672135  # Replace with your actual 3v3s role ID
+
+MATCH_ROLE_IDS = {
+    "1v1s": ROLE_1V1_ID,
+    "2v2s": ROLE_2V2_ID,
+    "3v3s": ROLE_3V3_ID,
+}
+
 
 # ---------------- DATABASE ----------------
 
