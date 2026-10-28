@@ -210,6 +210,46 @@ async def get_roblox_username(member):
         print(f"Username lookup failed: {type(error).__name__}: {error!r}")
         return None
 
+
+async def require_verification(interaction):
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.followup.send(
+            "Use this feature inside the server.",
+            ephemeral=True,
+        )
+        return False
+
+    if not BLOXLINK_API_KEY or not BLOXLINK_VERIFIED_ROLE_ID:
+        await interaction.followup.send(
+            "Bloxlink verification is not configured correctly. "
+            "Please contact server staff.",
+            ephemeral=True,
+        )
+        return False
+
+    if not any(
+        role.id == int(BLOXLINK_VERIFIED_ROLE_ID)
+        for role in interaction.user.roles
+    ):
+        await interaction.followup.send(
+            "You must verify with Bloxlink and receive the server's "
+            "verified role before hosting or joining.",
+            ephemeral=True,
+        )
+        return False
+
+    username = await get_roblox_username(interaction.user)
+    if not username:
+        await interaction.followup.send(
+            "I couldn't retrieve your Roblox username from Bloxlink. "
+            "Please try again shortly.",
+            ephemeral=True,
+        )
+        return False
+
+    return True
+
+
 # ---------------- MATCH EMBEDS ----------------
 
 def make_match_embed(match):
