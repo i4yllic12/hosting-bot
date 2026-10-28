@@ -184,25 +184,26 @@ async def get_roblox_username(member):
 
         roblox_id = data.get("robloxID") or data.get("robloxId")
         if not roblox_id:
-            print("Bloxlink response did not contain a Roblox ID.")
+            print(f"Bloxlink returned a Roblox ID: {bool(roblox_id)}")
             return None
 
         # Look up the Roblox username separately
         roblox_timeout = aiohttp.ClientTimeout(total=15, connect=5)
 
-        async with aiohttp.ClientSession(timeout=roblox_timeout) as session:
-            async with session.get(
-                f"https://users.roblox.com/v1/users/{roblox_id}"
-            ) as response:
-                print(f"Roblox HTTP status: {response.status}")
+       print("Starting Roblox username lookup...")
 
-                if response.status != 200:
-                    print(f"Roblox returned: {(await response.text())[:300]}")
-                    return None
+async with aiohttp.ClientSession(timeout=roblox_timeout) as session:
+    async with session.get(
+        f"https://users.roblox.com/v1/users/{roblox_id}"
+    ) as response:
+        print(f"Roblox HTTP status: {response.status}")
 
-                roblox_data = await response.json()
-                return roblox_data.get("name")
+        if response.status != 200:
+            print(f"Roblox returned: {(await response.text())[:300]}")
+            return None
 
+        roblox_data = await response.json()
+        return roblox_data.get("name")
     except asyncio.TimeoutError:
         print("Username lookup timed out. Check the last HTTP status printed.")
         return None
