@@ -235,17 +235,7 @@ async def require_verification(
         )
         return False
 
-    username = await get_roblox_username(interaction.user)
-
-    if not username:
-        await interaction.followup.send(
-            "I couldn't retrieve your Roblox username. Please try again shortly.",
-            ephemeral=True,
-        )
-        return False
-
     return True
-
 
 
 # ---------------- MATCH EMBEDS ----------------
