@@ -271,7 +271,25 @@ def make_match_embed(match):
     for index in range(SLOT_COUNTS.get(match["mode"], 2)):
         if index < len(players):
             player_id = players[index]
-            slots.append(f"Player {index + 1}: <@{player_id}>")
+            member = None
+
+            if match.get("guild_id"):
+                guild = bot.get_guild(match["guild_id"])
+                if guild:
+                    member = guild.get_member(player_id)
+
+            if member:
+                roblox_username = await get_roblox_username(member)
+                if roblox_username:
+                    player_name = (
+                        f"{member.mention} ({roblox_username})"
+                    )
+                else:
+                    player_name = f"{member.mention} (Roblox unlinked)"
+            else:
+                player_name = f"<@{player_id}>"
+
+            slots.append(f"Player {index + 1}: {player_name}")
         else:
             slots.append(f"Player {index + 1}: N/A")
 
