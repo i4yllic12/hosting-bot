@@ -700,7 +700,6 @@ async def on_message(message):
 
 # ---------------- SLASH COMMANDS ----------------
 
-
 @bot.tree.command(name="host", description="Create a match.")
 @app_commands.describe(
     mode="Match format",
@@ -726,7 +725,6 @@ async def host(
     region: app_commands.Choice[str],
     link: str = "",
 ):
-    # Respond to Discord immediately so the interaction doesn't time out.
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     try:
@@ -774,6 +772,17 @@ async def host(
 
         await send_match(interaction.guild, match_id)
 
+        # Ping the role that matches the hosted format.
+        role_id = MATCH_ROLE_IDS.get(mode.value)
+
+        if role_id:
+            await interaction.channel.send(
+                f"<@&{role_id}> A new **{mode.value}** match is available!",
+                allowed_mentions=discord.AllowedMentions(roles=True),
+            )
+        else:
+            print(f"No role ID configured for match format: {mode.value}")
+
         await interaction.followup.send(
             "Your match has been posted.", ephemeral=True
         )
@@ -786,7 +795,6 @@ async def host(
             "Please try again later or contact server staff.",
             ephemeral=True,
         )
-
 
 @bot.tree.command(name="hostinghelp", description="Hosting bot help.")
 async def hostinghelp(interaction: discord.Interaction):
