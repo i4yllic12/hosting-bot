@@ -1,33 +1,33 @@
+
 import os
+import json
 import sqlite3
 from datetime import datetime, timezone
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 # ---------------- CONFIGURATION ----------------
 
-HOST_ROLE_ID = 1565048538042208466
-
+HOST_ROLE_ID = int(os.getenv("HOST_ROLE_ID", "1565048538042208466"))
 GUILD_ID = int(os.getenv("GUILD_ID", "0") or "0")
 MATCH_RESULTS_CHANNEL_ID = int(
     os.getenv("MATCH_RESULTS_CHANNEL_ID", "0") or "0"
 )
-DB_PATH = os.getenv("DB_PATH", "./data/hosting.sqlite3")
-
-TOKEN = (
-    os.getenv("DISCORD_TOKEN")
-    or os.getenv("DISCORD_BOT_TOKEN")
-    or os.getenv("BOT_TOKEN")
-    or os.getenv("TOKEN")
+BLOXLINK_VERIFIED_ROLE_ID = int(
+    os.getenv("BLOXLINK_VERIFIED_ROLE_ID", "0") or "0"
 )
+BLOXLINK_API_KEY = os.getenv("BLOXLINK_API_KEY", "").strip()
+
+DB_PATH = os.getenv("DB_PATH", "./data/hosting.sqlite3")
+TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
 
 MODES = ("1v1s", "2v2s", "3v3s")
 REGIONS = ("NA", "EU", "OCE", "Other")
+SLOT_COUNTS = {"1v1s": 2, "2v2s": 4, "3v3s": 6}
 
-# The next message from a host who clicked Post Results is their result.
-# Key: (channel_id, user_id), value: match_id
 pending_results = {}
 
 
@@ -61,6 +61,21 @@ def init_db():
             )
         """)
 
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(matches)")
+        }
+
+        if "player_ids" not in columns:
+            conn.execute(
+                "ALTER TABLE matches ADD COLUMN player_ids TEXT NOT NULL DEFAULT '[]'"
+            )
+
+        if "private_server_link" not in columns:
+            conn.execute(
+                "ALTER TABLE matches ADD COLUMN private_server_link TEXT NOT NULL DEFAULT ''"
+            )
+
 
 def get_match(match_id):
     with db_connect() as conn:
@@ -69,21 +84,35 @@ def get_match(match_id):
         ).fetchone()
 
 
-def create_match(guild_id, channel_id, host_id, mode, region, players=""):
+def get_players(match):
+    try:
+        value = json.loads(match["player_ids"] or "[]")
+        return value if isinstance(value, list) else []
+    except (ValueError, TypeError, IndexError):
+        return []
+
+
+def create_match(
+    guild_id, channel_id, host_id, mode, region,
+    private_server_link="", player_ids=None
+):
     with db_connect() as conn:
         cur = conn.execute("""
-            INSERT INTO matches
-                (guild_id, channel_id, host_id, mode, region,
-                 players, status, result, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'open', '', ?)
+            INSERT INTO matches (
+                guild_id, channel_id, host_id, mode, region,
+                players, status, result, created_at,
+                player_ids, private_server_link
+            )
+            VALUES (?, ?, ?, ?, ?, '', 'open', '', ?, ?, ?)
         """, (
             guild_id,
             channel_id,
             host_id,
             mode,
             region,
-            players.strip(),
             datetime.now(timezone.utc).isoformat(),
+            json.dumps(player_ids or []),
+            private_server_link,
         ))
         return cur.lastrowid
 
@@ -91,82 +120,174 @@ def create_match(guild_id, channel_id, host_id, mode, region, players=""):
 def update_match(match_id, **fields):
     allowed = {
         "message_id", "host_id", "mode", "region", "players",
-        "status", "result", "channel_id"
+        "status", "result", "channel_id", "player_ids",
+        "private_server_link",
     }
-
-    fields = {
-        key: value for key, value in fields.items()
-        if key in allowed
-    }
+    fields = {k: v for k, v in fields.items() if k in allowed}
     if not fields:
         return
 
-    assignments = ", ".join(f"{key} = ?" for key in fields)
-    values = list(fields.values()) + [match_id]
-
+    assignments = ", ".join(f"{k} = ?" for k in fields)
     with db_connect() as conn:
         conn.execute(
             f"UPDATE matches SET {assignments} WHERE id = ?",
-            values,
+            list(fields.values()) + [match_id],
         )
 
 
-# ---------------- PERMISSIONS ----------------
+def save_players(match_id, player_ids):
+    update_match(match_id, player_ids=json.dumps(player_ids))
+
+
+# ---------------- VERIFICATION ----------------
 
 def has_host_role(member):
     return any(role.id == HOST_ROLE_ID for role in member.roles)
 
 
-def can_manage_match(interaction, match):
-    member = interaction.user
+def is_bloxlink_verified(member):
+    return (
+        BLOXLINK_VERIFIED_ROLE_ID != 0
+        and any(
+            role.id == BLOXLINK_VERIFIED_ROLE_ID
+            for role in member.roles
+        )
+    )
 
-    if not isinstance(member, discord.Member):
+
+async def get_roblox_username(member):
+    """Return the linked Roblox username, or None if lookup fails."""
+    if not BLOXLINK_API_KEY or not GUILD_ID:
+        return None
+
+    url = (
+        "https://api.blox.link/v4/public/guilds/"
+        f"{GUILD_ID}/discord-to-roblox/{member.id}"
+    )
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                url,
+                headers={"Authorization": BLOXLINK_API_KEY},
+            ) as response:
+                if response.status != 200:
+                    return None
+                data = await response.json()
+
+        roblox_id = (
+            data.get("robloxID")
+            or data.get("robloxId")
+            or data.get("roblox_id")
+        )
+
+        if not roblox_id:
+            user_data = data.get("user", {})
+            roblox_id = (
+                user_data.get("robloxID")
+                or user_data.get("robloxId")
+                or user_data.get("roblox_id")
+            )
+
+        if not roblox_id:
+            return None
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=8)
+        ) as session:
+            async with session.get(
+                f"https://users.roblox.com/v1/users/{int(roblox_id)}"
+            ) as response:
+                if response.status != 200:
+                    return None
+                roblox_data = await response.json()
+
+        return roblox_data.get("name")
+
+    except (aiohttp.ClientError, ValueError, TypeError, KeyError):
+        return None
+
+
+async def require_verification(interaction):
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "Use this feature inside the server.", ephemeral=True
+        )
         return False
 
-    return (
-        member.id == match["host_id"]
-        or has_host_role(member)
-        or member.guild_permissions.administrator
-        or member.guild_permissions.manage_guild
-    )
+    if not is_bloxlink_verified(interaction.user):
+        await interaction.response.send_message(
+            "You must verify with Bloxlink and receive the server's "
+            "verified role before hosting or joining. Use Bloxlink's "
+            "verification instructions, then try again.",
+            ephemeral=True,
+        )
+        return False
+
+    if not BLOXLINK_API_KEY or not BLOXLINK_VERIFIED_ROLE_ID:
+        await interaction.response.send_message(
+            "Bloxlink verification is not configured correctly. "
+            "Please contact server staff.",
+            ephemeral=True,
+        )
+        return False
+
+    username = await get_roblox_username(interaction.user)
+    if not username:
+        await interaction.response.send_message(
+            "I couldn't retrieve your linked Roblox username from "
+            "Bloxlink. Check your verification and try again later.",
+            ephemeral=True,
+        )
+        return False
+
+    return True
 
 
-# ---------------- EMBEDS ----------------
+# ---------------- MATCH EMBEDS ----------------
 
 def make_match_embed(match):
-    color = (
-        discord.Color.green()
-        if match["status"] == "completed"
-        else discord.Color.blurple()
-    )
-
+    completed = match["status"] == "completed"
     embed = discord.Embed(
         title=f"🎮 {match['mode']} Match",
-        color=color,
+        color=discord.Color.green() if completed else discord.Color.blurple(),
     )
 
     embed.add_field(name="Region", value=match["region"], inline=True)
     embed.add_field(
-        name="Hosted by",
-        value=f"<@{match['host_id']}>",
-        inline=True,
+        name="Hosted by", value=f"<@{match['host_id']}>", inline=True
     )
     embed.add_field(
-        name="Status",
-        value=match["status"].title(),
-        inline=True,
+        name="Status", value=match["status"].title(), inline=True
     )
+
+    players = get_players(match)
+    slots = []
+
+    for index in range(SLOT_COUNTS.get(match["mode"], 2)):
+        if index < len(players):
+            player_id = players[index]
+            slots.append(f"Player {index + 1}: <@{player_id}>")
+        else:
+            slots.append(f"Player {index + 1}: N/A")
+
     embed.add_field(
         name="Players",
-        value=match["players"] or "Not listed",
+        value="\n".join(slots),
         inline=False,
     )
 
+    if match["private_server_link"]:
+        embed.add_field(
+            name="Private Server",
+            value="Use the Join Private Server button below.",
+            inline=False,
+        )
+
     if match["result"]:
         embed.add_field(
-            name="Result",
-            value=match["result"][:1024],
-            inline=False,
+            name="Result", value=match["result"][:1024], inline=False
         )
 
     embed.set_footer(
@@ -226,33 +347,119 @@ async def refresh_match(guild, match_id):
 # ---------------- MATCH BUTTONS ----------------
 
 class MatchView(discord.ui.View):
-    """Persistent buttons for a particular match."""
-
     def __init__(self, match_id):
         super().__init__(timeout=None)
         self.match_id = match_id
 
-        results_button = discord.ui.Button(
+        join = discord.ui.Button(
+            label="Join Host",
+            emoji="➕",
+            style=discord.ButtonStyle.success,
+            custom_id=f"hosting:{match_id}:join",
+        )
+        join.callback = self.join_match
+        self.add_item(join)
+
+        leave = discord.ui.Button(
+            label="Leave Host",
+            emoji="➖",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"hosting:{match_id}:leave",
+        )
+        leave.callback = self.leave_match
+        self.add_item(leave)
+
+        results = discord.ui.Button(
             label="Post Results",
             emoji="📨",
             style=discord.ButtonStyle.success,
             custom_id=f"hosting:{match_id}:results",
         )
-        results_button.callback = self.post_results
-        self.add_item(results_button)
+        results.callback = self.post_results
+        self.add_item(results)
 
-        rehost_button = discord.ui.Button(
+        rehost = discord.ui.Button(
             label="Rehost",
             emoji="🔁",
             style=discord.ButtonStyle.primary,
             custom_id=f"hosting:{match_id}:rehost",
         )
-        rehost_button.callback = self.rehost
-        self.add_item(rehost_button)
+        rehost.callback = self.rehost
+        self.add_item(rehost)
+
+        match = get_match(match_id)
+        if match and match["private_server_link"]:
+            link_button = discord.ui.Button(
+                label="Join Private Server",
+                emoji="🔗",
+                style=discord.ButtonStyle.link,
+                url=match["private_server_link"],
+            )
+            self.add_item(link_button)
+
+    async def join_match(self, interaction):
+        match = get_match(self.match_id)
+        if not match or match["status"] != "open":
+            await interaction.response.send_message(
+                "This match is no longer open.", ephemeral=True
+            )
+            return
+
+        if not await require_verification(interaction):
+            return
+
+        players = get_players(match)
+        user_id = interaction.user.id
+
+        if user_id in players:
+            await interaction.response.send_message(
+                "You're already in this match.", ephemeral=True
+            )
+            return
+
+        capacity = SLOT_COUNTS[match["mode"]]
+        if len(players) >= capacity:
+            await interaction.response.send_message(
+                "This match is full.", ephemeral=True
+            )
+            return
+
+        players.append(user_id)
+        save_players(self.match_id, players)
+        await refresh_match(interaction.guild, self.match_id)
+
+        await interaction.response.send_message(
+            "You joined the match!", ephemeral=True
+        )
+
+    async def leave_match(self, interaction):
+        match = get_match(self.match_id)
+        if not match or match["status"] != "open":
+            await interaction.response.send_message(
+                "This match is no longer open.", ephemeral=True
+            )
+            return
+
+        if not await require_verification(interaction):
+            return
+
+        players = get_players(match)
+        if interaction.user.id not in players:
+            await interaction.response.send_message(
+                "You're not in this match.", ephemeral=True
+            )
+            return
+
+        players.remove(interaction.user.id)
+        save_players(self.match_id, players)
+        await refresh_match(interaction.guild, self.match_id)
+
+        await interaction.response.send_message(
+            "You left the match.", ephemeral=True
+        )
 
     async def post_results(self, interaction):
         match = get_match(self.match_id)
-
         if not match:
             await interaction.response.send_message(
                 "This match could not be found.", ephemeral=True
@@ -267,8 +474,7 @@ class MatchView(discord.ui.View):
 
         if not can_manage_match(interaction, match):
             await interaction.response.send_message(
-                "Only the match host, Host role members, or authorized staff "
-                "can post results.",
+                "Only the host or authorized staff can post results.",
                 ephemeral=True,
             )
             return
@@ -279,36 +485,25 @@ class MatchView(discord.ui.View):
             )
             return
 
-        key = (interaction.channel.id, interaction.user.id)
-        pending_results[key] = self.match_id
-
+        pending_results[(interaction.channel.id, interaction.user.id)] = (
+            self.match_id
+        )
         await interaction.response.send_message(
-            "Now type the match result as your next message in this channel. "
-            "Example: `Team A 30 - 24 Team B`. "
-            "The bot will forward it to #match-results.",
+            "Type the match result as your next message in this channel.",
             ephemeral=True,
         )
 
     async def rehost(self, interaction):
         match = get_match(self.match_id)
-
-        if not match:
+        if not match or match["status"] != "completed":
             await interaction.response.send_message(
-                "This match could not be found.", ephemeral=True
-            )
-            return
-
-        if match["status"] != "completed":
-            await interaction.response.send_message(
-                "Post the results before rehosting this match.",
-                ephemeral=True,
+                "Post the results before rehosting.", ephemeral=True
             )
             return
 
         if not can_manage_match(interaction, match):
             await interaction.response.send_message(
-                "Only the match host, Host role members, or authorized staff "
-                "can rehost this match.",
+                "You are not authorized to rehost this match.",
                 ephemeral=True,
             )
             return
@@ -327,7 +522,6 @@ class RehostView(discord.ui.View):
 
     async def create_rehost(self, interaction, same_players):
         old = get_match(self.match_id)
-
         if not old or old["status"] != "completed":
             await interaction.response.send_message(
                 "This match is not completed.", ephemeral=True
@@ -341,7 +535,8 @@ class RehostView(discord.ui.View):
             )
             return
 
-        new_players = old["players"] if same_players else ""
+        if not await require_verification(interaction):
+            return
 
         new_id = create_match(
             guild_id=old["guild_id"],
@@ -349,36 +544,42 @@ class RehostView(discord.ui.View):
             host_id=interaction.user.id,
             mode=old["mode"],
             region=old["region"],
-            players=new_players,
+            private_server_link=old["private_server_link"],
+            player_ids=get_players(old) if same_players else [],
         )
 
         await send_match(interaction.guild, new_id)
-
-        description = (
-            "New match created with the same players and region."
-            if same_players
-            else "Fresh match created with an empty player list."
-        )
-
         await interaction.response.send_message(
-            description, ephemeral=True
+            "Rehost created.", ephemeral=True
         )
 
-    @discord.ui.button(
-        label="Fresh Host",
-        emoji="🆕",
-        style=discord.ButtonStyle.primary,
-    )
+    @discord.ui.button(label="Fresh Host", emoji="🆕")
     async def fresh_host(self, interaction, button):
-        await self.create_rehost(interaction, same_players=False)
+        await self.create_rehost(interaction, False)
 
-    @discord.ui.button(
-        label="Rehost Same Players",
-        emoji="🔁",
-        style=discord.ButtonStyle.secondary,
-    )
+    @discord.ui.button(label="Rehost Same Players", emoji="🔁")
     async def same_players(self, interaction, button):
-        await self.create_rehost(interaction, same_players=True)
+        await self.create_rehost(interaction, True)
+
+
+def can_manage_match(interaction, match):
+    member = interaction.user
+    return isinstance(member, discord.Member) and (
+        member.id == match["host_id"]
+        or has_host_role(member)
+        or member.guild_permissions.administrator
+        or member.guild_permissions.manage_guild
+    )
+
+
+def can_manage_message(message, match):
+    member = message.author
+    return isinstance(member, discord.Member) and (
+        member.id == match["host_id"]
+        or has_host_role(member)
+        or member.guild_permissions.administrator
+        or member.guild_permissions.manage_guild
+    )
 
 
 # ---------------- BOT SETUP ----------------
@@ -386,18 +587,16 @@ class RehostView(discord.ui.View):
 intents = discord.Intents.default()
 intents.message_content = True
 
+
 class HostingBot(commands.Bot):
     async def setup_hook(self):
         init_db()
 
-        # Restore match buttons after bot restarts.
         with db_connect() as conn:
-            matches = conn.execute(
-                "SELECT id FROM matches"
-            ).fetchall()
+            matches = conn.execute("SELECT id FROM matches").fetchall()
 
-        for match in matches:
-            self.add_view(MatchView(int(match["id"])))
+        for row in matches:
+            self.add_view(MatchView(int(row["id"])))
 
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
@@ -405,8 +604,7 @@ class HostingBot(commands.Bot):
             synced = await self.tree.sync(guild=guild)
             print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
         else:
-            synced = await self.tree.sync()
-            print(f"Synced {len(synced)} global commands")
+            await self.tree.sync()
 
 
 bot = HostingBot(command_prefix="!", intents=intents)
@@ -424,11 +622,8 @@ async def on_message(message):
 
     if match_id is not None:
         match = get_match(match_id)
-
         if not message.content.strip():
-            await message.reply(
-                "Please type the result as text.", mention_author=False
-            )
+            await message.reply("Please type the result.", mention_author=False)
             return
 
         if not match or match["status"] != "open":
@@ -442,81 +637,53 @@ async def on_message(message):
         if not can_manage_message(message, match):
             pending_results.pop(key, None)
             await message.reply(
-                "You are not authorized to post results for this match.",
+                "You are not authorized to post these results.",
                 mention_author=False,
             )
             return
 
         results_channel = await find_results_channel(message.guild)
-
         if results_channel is None:
             await message.reply(
-                "I couldn't find #match-results. Create that channel or set "
-                "`MATCH_RESULTS_CHANNEL_ID` in FadeHost.",
+                "I couldn't find #match-results. Check its ID in FadeHost.",
                 mention_author=False,
             )
             return
 
         result_text = message.content.strip()
-
-        result_embed = make_match_embed(match)
-        result_embed.title = f"📋 Match Results — {match['mode']}"
-        result_embed.description = result_text
+        update_match(match_id, status="completed", result=result_text)
+        completed = get_match(match_id)
 
         try:
-            await results_channel.send(embed=result_embed)
-        except discord.Forbidden:
+            await results_channel.send(
+                embed=make_match_embed(completed)
+            )
+        except discord.HTTPException:
+            update_match(match_id, status="open", result="")
             await message.reply(
-                "I can't send messages in #match-results. Give me View "
-                "Channel, Send Messages, and Embed Links permissions.",
+                "I couldn't post the results. Check my channel permissions.",
                 mention_author=False,
             )
             return
 
         pending_results.pop(key, None)
-        update_match(
-            match_id,
-            status="completed",
-            result=result_text,
-        )
-
         await message.add_reaction("✅")
         await refresh_match(message.guild, match_id)
         await message.reply(
-            f"Results posted in {results_channel.mention}. "
-            "You can now use the Rehost button.",
+            f"Results posted in {results_channel.mention}.",
             mention_author=False,
         )
 
     await bot.process_commands(message)
 
 
-def can_manage_message(message, match):
-    member = message.author
-
-    return (
-        member.id == match["host_id"]
-        or (
-            isinstance(member, discord.Member)
-            and (
-                has_host_role(member)
-                or member.guild_permissions.administrator
-                or member.guild_permissions.manage_guild
-            )
-        )
-    )
-
-
 # ---------------- SLASH COMMANDS ----------------
 
-@bot.tree.command(
-    name="host",
-    description="Host a 1v1, 2v2, or 3v3 match.",
-)
+@bot.tree.command(name="host", description="Create a match.")
 @app_commands.describe(
-    mode="Choose the match format",
-    region="Choose the match region",
-    players="Optional player names or mentions, separated by commas",
+    mode="Match format",
+    region="Match region",
+    link="Optional Arsenal private server link",
 )
 @app_commands.choices(
     mode=[
@@ -535,7 +702,7 @@ async def host(
     interaction: discord.Interaction,
     mode: app_commands.Choice[str],
     region: app_commands.Choice[str],
-    players: str = "",
+    link: str = "",
 ):
     if not interaction.guild or not isinstance(
         interaction.user, discord.Member
@@ -545,17 +712,28 @@ async def host(
         )
         return
 
-    # Only the Host role can create a match.
     if not has_host_role(interaction.user):
         await interaction.response.send_message(
-            "You need the Host role to use `/host`.",
+            "You need the Host role to use /host.", ephemeral=True
+        )
+        return
+
+    if not await require_verification(interaction):
+        return
+
+    if link and not (
+        link.startswith("https://")
+        and "roblox.com" in link.lower()
+    ):
+        await interaction.response.send_message(
+            "Please provide a valid HTTPS Roblox private-server link.",
             ephemeral=True,
         )
         return
 
     if not isinstance(interaction.channel, discord.TextChannel):
         await interaction.response.send_message(
-            "Use `/host` in a text channel.", ephemeral=True
+            "Use /host in a text channel.", ephemeral=True
         )
         return
 
@@ -567,38 +745,30 @@ async def host(
         host_id=interaction.user.id,
         mode=mode.value,
         region=region.value,
-        players=players,
+        private_server_link=link,
     )
 
     await send_match(interaction.guild, match_id)
     await interaction.followup.send(
-        "Your match has been posted in this channel.", ephemeral=True
+        "Your match has been posted.", ephemeral=True
     )
 
 
-@bot.tree.command(
-    name="hostinghelp",
-    description="Show how to use the hosting bot.",
-)
+@bot.tree.command(name="hostinghelp", description="Hosting bot help.")
 async def hostinghelp(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="Arsenal Angels Hosting Bot",
-        color=discord.Color.blurple(),
-        description=(
-            "**/host** — create a match (Host role required).\n"
-            "Choose 1v1s, 2v2s, or 3v3s and a region: NA, EU, OCE, or Other.\n\n"
-            "**Post Results** — click the button, then type the result as "
-            "your next message in the hosting channel.\n"
-            "**Rehost** — after results are posted, choose Fresh Host or "
-            "Rehost Same Players."
-        ),
+    await interaction.response.send_message(
+        "**Arsenal Angels Hosting**\n"
+        "`/host` — create a match (Host role required).\n"
+        "Use Join Host or Leave Host to manage player slots.\n"
+        "Verified Roblox usernames are retrieved through Bloxlink.\n"
+        "Post Results lets the host submit the score; Rehost creates "
+        "another match after completion.",
+        ephemeral=True,
     )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 if not TOKEN:
-    raise RuntimeError(
-        "Set DISCORD_TOKEN in your FadeHost environment variables."
-    )
+    raise RuntimeError("Set DISCORD_TOKEN in FadeHost.")
 
 bot.run(TOKEN)
+
