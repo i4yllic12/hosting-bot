@@ -430,10 +430,7 @@ class MatchView(discord.ui.View):
         self.add_item(cancel)
     
     async def cancel_host(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ):
+         async def cancel_host(self, interaction: discord.Interaction):
         match = get_match(self.match_id)
 
         if not match:
