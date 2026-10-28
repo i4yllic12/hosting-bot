@@ -639,7 +639,6 @@ async def on_message(message):
             await bot.process_commands(message)
             return
 
-        # Require an image attachment.
         screenshot = next(
             (
                 attachment
@@ -652,8 +651,7 @@ async def on_message(message):
 
         if screenshot is None:
             await message.reply(
-                "📸 Please attach a screenshot of the match results. "
-                "Your results have not been submitted yet.",
+                "📸 Please attach a screenshot of the match results.",
                 mention_author=False,
             )
             await bot.process_commands(message)
@@ -675,43 +673,28 @@ async def on_message(message):
 
         try:
             await results_channel.send(
-                content=(
-                    f"📸 **Match screenshot submitted by "
-                    f"{message.author.mention}**"
-                ),
+                content=f"📸 Match screenshot submitted by {message.author.mention}",
                 embed=make_match_embed(completed),
-                files=[
-                    await screenshot.to_file(
-                        filename=screenshot.filename
-                    )
-                ],
+                files=[await screenshot.to_file()],
             )
         except (discord.HTTPException, OSError) as error:
             print(f"Could not post match screenshot: {error!r}")
             update_match(match_id, status="open", result="")
             await message.reply(
-                "I couldn't post the screenshot. Check my permissions "
-                "in #match-results and try again.",
+                "I couldn't post the screenshot. Check my permissions.",
                 mention_author=False,
             )
             await bot.process_commands(message)
             return
 
-              pending_results.pop(key, None)
+        pending_results.pop(key, None)
 
-        # Delete the original screenshot message from the host channel.
         try:
             await message.delete()
         except discord.HTTPException as error:
             print(f"Could not delete original screenshot: {error!r}")
 
         await refresh_match(message.guild, match_id)
-
-        # The screenshot copy remains in #match-results.
-        await message.channel.send(
-            f"✅ Results were posted in {results_channel.mention}.",
-            reference=None,
-        )
 
     await bot.process_commands(message)
 
