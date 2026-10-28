@@ -184,6 +184,7 @@ async def get_roblox_username(member):
                 data = await response.json(content_type=None)
 
         roblox_id = data.get("robloxID") or data.get("robloxId")
+        print("Bloxlink response data:", data)
         print(f"Bloxlink returned a Roblox ID: {bool(roblox_id)}")
 
         if not roblox_id:
