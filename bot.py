@@ -156,33 +156,56 @@ def is_bloxlink_verified(member):
     )
 
 
-async def get_roblox_username(member):
-    try:
-        timeout = aiohttp.ClientTimeout(total=15)
 
+async def get_roblox_username(member):
+    timeout = aiohttp.ClientTimeout(total=15)
+
+    try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
+            url = (
+                f"https://api.blox.link/v4/public/guilds/"
+                f"{GUILD_ID}/discord-to-roblox/{member.id}"
+            )
+
             async with session.get(
-                f"https://api.blox.link/v4/public/guilds/{GUILD_ID}/discord-to-roblox/{member.id}",
+                url,
                 headers={"Authorization": BLOXLINK_API_KEY},
             ) as response:
+                body = await response.text()
+
+                print(f"Bloxlink status: {response.status}")
+                print(f"Bloxlink response: {body[:500]}")
+
                 if response.status != 200:
                     return None
 
-                data = await response.json()
+                try:
+                    data = await response.json(
+                        content_type=None
+                    )
+                except ValueError:
+                    print("Bloxlink returned invalid JSON.")
+                    return None
 
-        roblox_id = data.get("robloxID") or data.get("robloxId")
-        if not roblox_id:
-            return None
+            roblox_id = (
+                data.get("robloxID")
+                or data.get("robloxId")
+                or data.get("roblox_id")
+            )
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+            if not roblox_id:
+                print("No Roblox ID found in Bloxlink response.")
+                return None
+
             async with session.get(
                 f"https://users.roblox.com/v1/users/{roblox_id}"
             ) as response:
                 if response.status != 200:
+                    print(f"Roblox API status: {response.status}")
                     return None
 
-                data = await response.json()
-                return data.get("name")
+                roblox_data = await response.json()
+                return roblox_data.get("name")
 
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
         print(f"Bloxlink/Roblox lookup failed: {error}")
