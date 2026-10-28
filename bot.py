@@ -158,11 +158,13 @@ def is_bloxlink_verified(member):
 
 
 
-async def get_roblox_username(member):
-    timeout = aiohttp.ClientTimeout(total=30, connect=10)
 
+async def get_roblox_username(member):
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        # Check Bloxlink first
+        bloxlink_timeout = aiohttp.ClientTimeout(total=15, connect=5)
+
+        async with aiohttp.ClientSession(timeout=bloxlink_timeout) as session:
             url = (
                 f"https://api.blox.link/v4/public/guilds/"
                 f"{GUILD_ID}/discord-to-roblox/{member.id}"
@@ -172,82 +174,41 @@ async def get_roblox_username(member):
                 url,
                 headers={"Authorization": BLOXLINK_API_KEY},
             ) as response:
-                body = await response.text()
-                print(f"Bloxlink status: {response.status}")
-                print(f"Bloxlink response: {body[:500]}")
+                print(f"Bloxlink HTTP status: {response.status}")
 
                 if response.status != 200:
+                    print(f"Bloxlink returned: {(await response.text())[:300]}")
                     return None
 
                 data = await response.json(content_type=None)
 
-            roblox_id = (
-                data.get("robloxID")
-                or data.get("robloxId")
-                or data.get("roblox_id")
-            )
+        roblox_id = data.get("robloxID") or data.get("robloxId")
+        if not roblox_id:
+            print("Bloxlink response did not contain a Roblox ID.")
+            return None
 
-            if not roblox_id:
-                print("No Roblox ID found in Bloxlink response.")
-                return None
+        # Look up the Roblox username separately
+        roblox_timeout = aiohttp.ClientTimeout(total=15, connect=5)
 
+        async with aiohttp.ClientSession(timeout=roblox_timeout) as session:
             async with session.get(
                 f"https://users.roblox.com/v1/users/{roblox_id}"
             ) as response:
+                print(f"Roblox HTTP status: {response.status}")
+
                 if response.status != 200:
-                    print(f"Roblox API status: {response.status}")
+                    print(f"Roblox returned: {(await response.text())[:300]}")
                     return None
 
                 roblox_data = await response.json()
                 return roblox_data.get("name")
 
-    except Exception as error:
-        print(
-            f"Bloxlink/Roblox lookup failed: "
-            f"{type(error).__name__}: {error!r}"
-        )
+    except asyncio.TimeoutError:
+        print("Username lookup timed out. Check the last HTTP status printed.")
         return None
-
-
-
-async def require_verification(interaction):
-    if not isinstance(interaction.user, discord.Member):
-        await interaction.followup.send(
-            "Use this feature inside the server.",
-            ephemeral=True,
-        )
-        return False
-
-    if not BLOXLINK_API_KEY or not BLOXLINK_VERIFIED_ROLE_ID:
-        await interaction.followup.send(
-            "Bloxlink verification is not configured correctly. "
-            "Please contact server staff.",
-            ephemeral=True,
-        )
-        return False
-
-    if not any(
-        role.id == int(BLOXLINK_VERIFIED_ROLE_ID)
-        for role in interaction.user.roles
-    ):
-        await interaction.followup.send(
-            "You must verify with Bloxlink and receive the server's "
-            "verified role before hosting or joining.",
-            ephemeral=True,
-        )
-        return False
-
-    username = await get_roblox_username(interaction.user)
-    if not username:
-        await interaction.followup.send(
-            "I couldn't retrieve your Roblox username from Bloxlink. "
-            "Please try again shortly.",
-            ephemeral=True,
-        )
-        return False
-
-    return True
-
+    except (aiohttp.ClientError, ValueError) as error:
+        print(f"Username lookup failed: {type(error).__name__}: {error!r}")
+        return None
 
 # ---------------- MATCH EMBEDS ----------------
 
