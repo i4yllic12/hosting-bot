@@ -190,11 +190,10 @@ async def get_roblox_username(member):
 
 async def require_verification(interaction):
     if not isinstance(interaction.user, discord.Member):
-      await interaction.followup.send(
+        await interaction.followup.send(
             "Use this feature inside the server.", ephemeral=True
         )
         return False
-
     if not is_bloxlink_verified(interaction.user):
         await interaction.followup.send(
             "You must verify with Bloxlink and receive the server's "
