@@ -419,6 +419,43 @@ class MatchView(discord.ui.View):
             )
             self.add_item(link_button)
 
+        @discord.ui.button(
+        label="Cancel Host",
+        style=discord.ButtonStyle.danger,
+        emoji="🛑",
+        row=2,
+    )
+    async def cancel_host(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        match = get_match(self.match_id)
+
+        if not match:
+            await interaction.response.send_message(
+                "Match not found.", ephemeral=True
+            )
+            return
+
+        if match["status"] != "open":
+            await interaction.response.send_message(
+                "This match is no longer open.", ephemeral=True
+            )
+            return
+
+        if not can_manage_match(interaction, match):
+            await interaction.response.send_message(
+                "Only the host or authorized staff can cancel this match.",
+                ephemeral=True,
+            )
+            return
+
+        update_match(self.match_id, status="cancelled")
+
+        await interaction.response.defer()
+        await refresh_match(interaction.guild, self.match_id)
+
     async def join_match(self, interaction):
         match = get_match(self.match_id)
         if not match or match["status"] != "open":
