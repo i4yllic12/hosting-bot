@@ -156,58 +156,36 @@ def is_bloxlink_verified(member):
 
 
 async def get_roblox_username(member):
-    """Return the linked Roblox username, or None if lookup fails."""
-    if not BLOXLINK_API_KEY or not GUILD_ID:
-        return None
-
-    url = (
-        "https://api.blox.link/v4/public/guilds/"
-        f"{GUILD_ID}/discord-to-roblox/{member.id}"
-    )
-
     try:
-        timeout = aiohttp.ClientTimeout(total=8)
+        timeout = aiohttp.ClientTimeout(total=15)
+
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(
-                url,
+                f"https://api.blox.link/v4/public/guilds/{GUILD_ID}/discord-to-roblox/{member.id}",
                 headers={"Authorization": BLOXLINK_API_KEY},
             ) as response:
                 if response.status != 200:
                     return None
+
                 data = await response.json()
 
-        roblox_id = (
-            data.get("robloxID")
-            or data.get("robloxId")
-            or data.get("roblox_id")
-        )
-
-        if not roblox_id:
-            user_data = data.get("user", {})
-            roblox_id = (
-                user_data.get("robloxID")
-                or user_data.get("robloxId")
-                or user_data.get("roblox_id")
-            )
-
+        roblox_id = data.get("robloxID") or data.get("robloxId")
         if not roblox_id:
             return None
 
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=8)
-        ) as session:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(
-                f"https://users.roblox.com/v1/users/{int(roblox_id)}"
+                f"https://users.roblox.com/v1/users/{roblox_id}"
             ) as response:
                 if response.status != 200:
                     return None
-                roblox_data = await response.json()
 
-        return roblox_data.get("name")
+                data = await response.json()
+                return data.get("name")
 
-    except (aiohttp.ClientError, ValueError, TypeError, KeyError):
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+        print(f"Bloxlink/Roblox lookup failed: {error}")
         return None
-
 
 async def require_verification(interaction):
     if not isinstance(interaction.user, discord.Member):
