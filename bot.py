@@ -409,7 +409,7 @@ class MatchView(discord.ui.View):
         rehost.callback = self.rehost
         self.add_item(rehost)
 
-      match = get_match(match_id)
+            match = get_match(match_id)
         if match and match["private_server_link"]:
             link_button = discord.ui.Button(
                 label="Join Private Server",
