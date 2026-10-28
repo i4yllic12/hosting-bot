@@ -451,7 +451,7 @@ class MatchView(discord.ui.View):
             "You left the match.", ephemeral=True
         )
 
-      async def post_results(self, interaction):
+    async def post_results(self, interaction):
         match = get_match(self.match_id)
 
         if not match:
@@ -487,12 +487,10 @@ class MatchView(discord.ui.View):
         )
 
         await interaction.response.send_message(
-            "📸 **Screenshot required!** Send your next message in this "
-            "channel with a screenshot of the match results attached. "
-            "Messages without an image won't be accepted.",
+            "📸 Screenshot required! Send your next message in this "
+            "channel with a screenshot of the match results attached.",
             ephemeral=True,
         )
-
     async def rehost(self, interaction):
         match = get_match(self.match_id)
         if not match or match["status"] != "completed":
