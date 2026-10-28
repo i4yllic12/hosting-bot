@@ -409,7 +409,7 @@ class MatchView(discord.ui.View):
         rehost.callback = self.rehost
         self.add_item(rehost)
 
-        match = get_match(match_id)
+         match = get_match(match_id)
         if match and match["private_server_link"]:
             link_button = discord.ui.Button(
                 label="Join Private Server",
@@ -418,12 +418,16 @@ class MatchView(discord.ui.View):
                 url=match["private_server_link"],
             )
             self.add_item(link_button)
-            @discord.ui.button(
-        label="Cancel Host",
-        style=discord.ButtonStyle.danger,
-        emoji="🛑",
-        row=2,
-        custom_id="hosting:cancel_host",
+
+        cancel = discord.ui.Button(
+            label="Cancel Host",
+            style=discord.ButtonStyle.danger,
+            emoji="🛑",
+            row=2,
+            custom_id=f"hosting:{match_id}:cancel",
+        )
+        cancel.callback = self.cancel_host
+        self.add_item(cancel)
     )
     async def cancel_host(
         self,
