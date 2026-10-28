@@ -159,7 +159,7 @@ def is_bloxlink_verified(member):
 
 
 async def get_roblox_username(member):
-    timeout = aiohttp.ClientTimeout(total=15)
+    timeout = aiohttp.ClientTimeout(total=30, connect=10)
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
