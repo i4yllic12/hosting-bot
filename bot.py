@@ -217,6 +217,36 @@ async def get_roblox_username(member):
         return None
 
 
+async def require_verification(
+    interaction: discord.Interaction,
+) -> bool:
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.followup.send(
+            "Use this feature inside the server.",
+            ephemeral=True,
+        )
+        return False
+
+    if not is_bloxlink_verified(interaction.user):
+        await interaction.followup.send(
+            "You must verify with Bloxlink and receive the verified role before hosting or joining.",
+            ephemeral=True,
+        )
+        return False
+
+    username = await get_roblox_username(interaction.user)
+
+    if not username:
+        await interaction.followup.send(
+            "I couldn't retrieve your Roblox username. Please try again shortly.",
+            ephemeral=True,
+        )
+        return False
+
+    return True
+
+
+
 # ---------------- MATCH EMBEDS ----------------
 
 def make_match_embed(match):
