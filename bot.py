@@ -419,7 +419,7 @@ class MatchView(discord.ui.View):
             )
             self.add_item(link_button)
 
-        @discord.ui.button(
+            @discord.ui.button(
         label="Cancel Host",
         style=discord.ButtonStyle.danger,
         emoji="🛑",
