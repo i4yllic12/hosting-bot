@@ -1429,8 +1429,7 @@ async def on_message(message):
                 reference=results_message,
                 mention_author=False,
             )
-
-                       winner_ids = [
+            winner_ids = [
                 str(p["user_id"])
                 for p in parsed_players
                 if p["won"]
@@ -1446,7 +1445,7 @@ async def on_message(message):
 
             await message.reply(
                 f"Match #{match_id} completed! Elo has been updated "
-                f"automatically for every player."
+                "automatically for every player."
             )
 
             await refresh_match(bot, match_id)
