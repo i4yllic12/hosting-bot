@@ -1430,16 +1430,16 @@ async def on_message(message):
                 mention_author=False,
             )
 
+                       winner_ids = [
+                str(p["user_id"])
+                for p in parsed_players
+                if p["won"]
+            ]
+
             update_match(
                 match_id,
                 status="completed",
-                result=(
-                    f"Winner: {', '.join(
-                        str(p['user_id'])
-                        for p in parsed_players
-                        if p['won']
-                    )}"
-                ),
+                result=f"Winner IDs: {', '.join(winner_ids)}",
             )
 
             pending_results.pop(key, None)
