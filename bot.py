@@ -534,13 +534,16 @@ class SubsSelect(discord.ui.Select):
         for player in players:
             user_id = int(player["user_id"])
 
-            options.append(
-                discord.SelectOption(
-                    label=f"Player {user_id}",
-                    description=f"Remove player ID {user_id} from this lobby.",
-                    value=str(user_id),
-                )
-            )
+            member = interaction.guild.get_member(int(user_id))
+
+if member:
+    options.append(
+        discord.SelectOption(
+            label=member.display_name[:100],
+            description=f"Remove {member.name} from this lobby.",
+            value=str(user_id),
+        )
+    )
 
         super().__init__(
             placeholder="Choose a player to remove...",
