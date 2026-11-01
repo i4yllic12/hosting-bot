@@ -1,12 +1,11 @@
+
 import os
 import re
 import json
-import math
 import sqlite3
-import asyncio
 from datetime import datetime, timezone
+from urllib.parse import urlparse, parse_qs
 
-import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -16,57 +15,44 @@ from discord.ext import commands, tasks
 # CONFIGURATION
 # ============================================================
 
-TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
-
-HOST_ROLE_ID = int(os.getenv("HOST_ROLE_ID", "1565048538042208466"))
-STAFF_ROLE_ID = int(os.getenv("STAFF_ROLE_ID", "1564857946599456878"))
-ELO_MANAGER_ROLE_ID = int(
-    os.getenv("ELO_MANAGER_ROLE_ID", "1565158910292398184")
-)
-
+TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", "0") or "0")
-MATCH_RESULTS_CHANNEL_ID = int(
+
+HOSTING_CHANNEL_ID = 1565049435606622348
+HOST_ROLE_ID = 1565048538042208466
+STAFF_ROLE_ID = 1564857946599456878
+ELO_MANAGER_ROLE_ID = 1565158910292398184
+
+RESULTS_CHANNEL_ID = int(
     os.getenv("MATCH_RESULTS_CHANNEL_ID", "0") or "0"
 )
 
-BLOXLINK_VERIFIED_ROLE_ID = int(
+VERIFIED_ROLE_ID = int(
     os.getenv("BLOXLINK_VERIFIED_ROLE_ID", "0") or "0"
 )
-BLOXLINK_API_KEY = os.getenv("BLOXLINK_API_KEY", "").strip()
 
 DB_PATH = os.getenv("DB_PATH", "./data/hosting.sqlite3")
 
-MODES = ("1v1s", "2v2s", "3v3s")
-REGIONS = ("NA", "EU", "OCE", "Other")
+STARTING_ELO = 1000
+K_FACTOR = 32
 
-SLOT_COUNTS = {
+MODES = ("1v1s", "2v2s", "3v3s")
+
+SLOTS = {
     "1v1s": 2,
     "2v2s": 4,
     "3v3s": 6,
 }
 
-ROLE_1V1_ID = 1564896767257084036
-ROLE_2V2_ID = 1564896807673270382
-ROLE_3V3_ID = 1564896826723672135
+ELO_MODES = ("1v1", "2v2", "3v3")
 
 MATCH_ROLE_IDS = {
-    "1v1s": ROLE_1V1_ID,
-    "2v2s": ROLE_2V2_ID,
-    "3v3s": ROLE_3V3_ID,
+    "1v1s": 1564896767257084036,
+    "2v2s": 1564896807673270382,
+    "3v3s": 1564896826723672135,
 }
-
-ELO_MODES = {
-    "1v1": 1,
-    "2v2": 2,
-    "3v3": 3,
-}
-
-STARTING_ELO = 1000
-K_FACTOR = 32
 
 pending_results = {}
-roblox_username_cache = {}
-processing_matches = set()
 
 
 # ============================================================
@@ -81,13 +67,17 @@ def db_connect():
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+
     return conn
 
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def init_db():
     with db_connect() as conn:
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS matches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,11 +88,10 @@ def init_db():
                 mode TEXT NOT NULL,
                 region TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'open',
-                roster TEXT NOT NULL,
+                roster TEXT NOT NULL DEFAULT '[]',
+                private_server_link TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                completed_at TEXT,
-                last_reminder_at TEXT,
-                private_server_link TEXT
+                last_reminder_at TEXT
             )
         """)
 
@@ -116,15 +105,6 @@ def init_db():
                 losses INTEGER NOT NULL DEFAULT 0,
                 matches INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (guild_id, user_id, mode)
-            )
-        """)
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS player_platforms (
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                platform TEXT NOT NULL,
-                PRIMARY KEY (guild_id, user_id)
             )
         """)
 
@@ -152,287 +132,40 @@ def init_db():
             )
         """)
 
-        # Migrate older matches tables.
+        # Migrate older match databases.
         columns = {
-            row[1]
+            row["name"]
             for row in conn.execute(
                 "PRAGMA table_info(matches)"
             ).fetchall()
         }
 
-        if "roster" not in columns:
-            conn.execute(
-                "ALTER TABLE matches ADD COLUMN roster TEXT NOT NULL DEFAULT '[]'"
-            )
+        migrations = {
+            "message_id": "INTEGER",
+            "roster": "TEXT NOT NULL DEFAULT '[]'",
+            "private_server_link": "TEXT",
+            "last_reminder_at": "TEXT",
+        }
 
-        if "private_server_link" not in columns:
-            conn.execute(
-                "ALTER TABLE matches ADD COLUMN private_server_link TEXT"
-            )
-
-        if "last_reminder_at" not in columns:
-            conn.execute(
-                "ALTER TABLE matches ADD COLUMN last_reminder_at TEXT"
-            )
+        for column, definition in migrations.items():
+            if column not in columns:
+                conn.execute(
+                    f"ALTER TABLE matches ADD COLUMN "
+                    f"{column} {definition}"
+                )
 
         conn.commit()
 
 
-
-        # Add the reminder column to older databases if it is missing.
-        columns = {
-            row["name"]
-            for row in conn.execute("PRAGMA table_info(matches)").fetchall()
-        }
-
-        if "last_reminder_at" not in columns:
-            conn.execute(
-                "ALTER TABLE matches ADD COLUMN last_reminder_at TEXT"
-            )
-
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def mode_to_elo_mode(mode):
-    return mode[:-1] if mode.endswith("s") else mode
-
-
-def ensure_rating(conn, guild_id, user_id, mode):
-    conn.execute("""
-        INSERT OR IGNORE INTO ratings
-        (guild_id, user_id, mode, elo, wins, losses, matches)
-        VALUES (?, ?, ?, ?, 0, 0, 0)
-    """, (guild_id, user_id, mode, STARTING_ELO))
-
-    return conn.execute("""
-        SELECT *
-        FROM ratings
-        WHERE guild_id = ? AND user_id = ? AND mode = ?
-    """, (guild_id, user_id, mode)).fetchone()
-
-
-def get_rating(guild_id, user_id, mode):
-    with db_connect() as conn:
-        row = ensure_rating(conn, guild_id, user_id, mode)
-        return dict(row)
-
-
-def get_team_average(players, guild_id, mode):
-    if not players:
-        return STARTING_ELO
-
-    values = [
-        get_rating(guild_id, player["user_id"], mode)["elo"]
-        for player in players
-    ]
-
-    return sum(values) / len(values)
-
-
 # ============================================================
-# ELO CALCULATIONS
-# ============================================================
-
-def expected_score(player_elo, opponent_elo):
-    return 1 / (
-        1 + 10 ** ((opponent_elo - player_elo) / 400)
-    )
-
-
-def calculate_team_elo_change(team_elo, opponent_elo, won):
-    expected = expected_score(team_elo, opponent_elo)
-    actual = 1.0 if won else 0.0
-    return K_FACTOR * (actual - expected)
-
-
-def calculate_individual_changes(players, scores, guild_id, mode):
-    """
-    Weighted ELO system:
-    70% match result
-    20% individual performance
-    10% opponent difficulty
-
-    Team averages are used to calculate the expected match result.
-    """
-
-    red_players = [p for p in players if p["team"] == "red"]
-    blue_players = [p for p in players if p["team"] == "blue"]
-
-    red_average = get_team_average(red_players, guild_id, mode)
-    blue_average = get_team_average(blue_players, guild_id, mode)
-
-    red_score = scores["red"]
-    blue_score = scores["blue"]
-
-    if red_score == blue_score:
-        raise ValueError("Tied match scores are not supported.")
-
-    red_won = red_score > blue_score
-
-    red_points = [int(p["score"]) for p in red_players]
-    blue_points = [int(p["score"]) for p in blue_players]
-
-    red_mean = sum(red_points) / max(1, len(red_points))
-    blue_mean = sum(blue_points) / max(1, len(blue_points))
-
-    changes = {}
-
-    for player in players:
-        is_red = player["team"] == "red"
-        team_average = red_average if is_red else blue_average
-        opponent_average = blue_average if is_red else red_average
-        won = red_won if is_red else not red_won
-
-        expected = expected_score(team_average, opponent_average)
-        actual = 1.0 if won else 0.0
-
-        # 70%: match result.
-        result_part = 0.70 * K_FACTOR * (actual - expected)
-
-        # 20%: individual performance compared with teammates.
-        team_mean = red_mean if is_red else blue_mean
-        performance = (
-            int(player["score"]) - team_mean
-        ) / max(10.0, team_mean)
-
-        performance = max(-1.0, min(1.0, performance))
-        performance_part = 0.20 * K_FACTOR * performance
-
-        # 10%: difficulty of the opposing team's rating.
-        difficulty = (
-            opponent_average - team_average
-        ) / 400.0
-
-        difficulty = max(-1.0, min(1.0, difficulty))
-        difficulty_part = 0.10 * K_FACTOR * difficulty
-
-        delta = round(
-            result_part + performance_part + difficulty_part
-        )
-
-        # Keep the direction consistent with the match outcome.
-        if won:
-            delta = max(1, delta)
-        else:
-            delta = min(-1, delta)
-
-        changes[player["user_id"]] = {
-            "delta": delta,
-            "won": won,
-            "score": int(player["score"]),
-            "team": player["team"],
-        }
-
-    return changes
-
-
-def apply_elo_result(
-    hosting_match_id,
-    guild_id,
-    mode,
-    players,
-    scores,
-):
-    changes = calculate_individual_changes(
-        players,
-        scores,
-        guild_id,
-        mode,
-    )
-
-    old_values = {}
-
-    with db_connect() as conn:
-        existing = conn.execute("""
-            SELECT id
-            FROM elo_matches
-            WHERE hosting_match_id = ?
-        """, (hosting_match_id,)).fetchone()
-
-        if existing:
-            raise ValueError("ELO has already been applied to this match.")
-
-        for user_id, result in changes.items():
-            row = ensure_rating(conn, guild_id, user_id, mode)
-            old_values[str(user_id)] = dict(row)
-
-            conn.execute("""
-                UPDATE ratings
-                SET elo = elo + ?,
-                    wins = wins + ?,
-                    losses = losses + ?,
-                    matches = matches + 1
-                WHERE guild_id = ? AND user_id = ? AND mode = ?
-            """, (
-                result["delta"],
-                1 if result["won"] else 0,
-                0 if result["won"] else 1,
-                guild_id,
-                user_id,
-                mode,
-            ))
-
-        result_data = {
-            "old_values": old_values,
-            "changes": {
-                str(user_id): result
-                for user_id, result in changes.items()
-            },
-            "scores": scores,
-        }
-
-        conn.execute("""
-            INSERT INTO elo_matches
-            (hosting_match_id, guild_id, mode, result_data, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            hosting_match_id,
-            guild_id,
-            mode,
-            json.dumps(result_data),
-            now_iso(),
-        ))
-
-    return changes# ============================================================
-# DISCORD BOT SETUP
-# ============================================================
-
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True
-intents.messages = True
-intents.message_content = True
-
-
-class HostingBot(commands.Bot):
-    async def setup_hook(self):
-        init_db()
-
-        if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-        else:
-            await self.tree.sync()
-
-
-bot = HostingBot(
-    command_prefix="!",
-    intents=intents,
-)
-
-
-# ============================================================
-# PERMISSIONS AND MEMBER HELPERS
+# PERMISSIONS
 # ============================================================
 
 def has_role(member, role_id):
-    if not role_id:
-        return False
-
-    return any(role.id == role_id for role in member.roles)
+    return any(
+        role.id == role_id
+        for role in getattr(member, "roles", [])
+    )
 
 
 def is_staff(member):
@@ -444,31 +177,36 @@ def is_staff(member):
 
 def can_manage_elo(member):
     return (
-        member.guild_permissions.administrator
-        or has_role(member, STAFF_ROLE_ID)
+        is_staff(member)
         or has_role(member, ELO_MANAGER_ROLE_ID)
     )
 
 
 def can_host(member):
     return (
-        member.guild_permissions.administrator
+        is_staff(member)
         or has_role(member, HOST_ROLE_ID)
-        or is_staff(member)
     )
 
 
 def is_verified(member):
-    if not BLOXLINK_VERIFIED_ROLE_ID:
-        return True
+    return (
+        not VERIFIED_ROLE_ID
+        or has_role(member, VERIFIED_ROLE_ID)
+    )
 
-    return has_role(member, BLOXLINK_VERIFIED_ROLE_ID)
+
+def can_edit_match(member, match):
+    return (
+        member.id == int(match["host_id"])
+        or is_staff(member)
+    )
 
 
 async def require_verified(interaction):
     if not is_verified(interaction.user):
         await interaction.response.send_message(
-            "You must be verified before using this feature.",
+            "You must be verified before using this command.",
             ephemeral=True,
         )
         return False
@@ -476,26 +214,49 @@ async def require_verified(interaction):
     return True
 
 
-async def require_host(interaction):
-    if not can_host(interaction.user):
-        await interaction.response.send_message(
-            "You do not have permission to host matches.",
-            ephemeral=True,
-        )
-        return False
+# ============================================================
+# MATCH DATABASE FUNCTIONS
+# ============================================================
 
-    return True
+def create_match(
+    guild_id,
+    host_id,
+    mode,
+    region,
+    private_server_link,
+):
+    created = now_iso()
 
+    roster = [{"user_id": int(host_id)}]
 
-async def require_staff(interaction):
-    if not is_staff(interaction.user):
-        await interaction.response.send_message(
-            "This command is restricted to tournament staff.",
-            ephemeral=True,
-        )
-        return False
+    with db_connect() as conn:
+        cursor = conn.execute("""
+            INSERT INTO matches (
+                guild_id,
+                channel_id,
+                host_id,
+                mode,
+                region,
+                status,
+                roster,
+                private_server_link,
+                created_at,
+                last_reminder_at
+            )
+            VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+        """, (
+            guild_id,
+            HOSTING_CHANNEL_ID,
+            host_id,
+            mode,
+            region,
+            json.dumps(roster),
+            private_server_link,
+            created,
+            created,
+        ))
 
-    return True
+        return cursor.lastrowid
 
 
 def get_match(match_id):
@@ -508,291 +269,118 @@ def get_match(match_id):
     return dict(row) if row else None
 
 
+def get_open_matches():
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM matches WHERE status = 'open'"
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
 def save_roster(match_id, roster):
     with db_connect() as conn:
-        conn.execute("""
-            UPDATE matches
-            SET roster = ?
-            WHERE id = ?
-        """, (json.dumps(roster), match_id))
+        conn.execute(
+            "UPDATE matches SET roster = ? WHERE id = ?",
+            (json.dumps(roster), match_id),
+        )
+
+
+def update_match_status(match_id, status):
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE matches SET status = ? WHERE id = ?",
+            (status, match_id),
+        )
+
+
+def update_message_id(match_id, message_id):
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE matches SET message_id = ? WHERE id = ?",
+            (message_id, match_id),
+        )
+
 
 def get_roster(match):
-    if not match:
-        return []
-
-    roster_data = match.get("roster", "[]")
-
     try:
-        return json.loads(roster_data)
+        return json.loads(match.get("roster") or "[]")
     except (TypeError, json.JSONDecodeError):
         return []
 
 
-def get_mode_slots(mode):
-    return SLOT_COUNTS.get(mode, 0)
-
-
-def match_is_open(match):
+def is_open(match):
     return bool(match and match["status"] == "open")
 
 
-def roster_is_full(match):
-    if not match:
-        return False
-
-    roster = get_roster(match)
-    required_slots = get_mode_slots(match.get("mode", ""))
-
-    if required_slots == 0:
-        return False
-
-    return len(roster) >= required_slots
+def is_full(match):
+    return (
+        len(get_roster(match))
+        >= SLOTS.get(match["mode"], 0)
+    )
 
 
-def member_in_roster(roster, user_id):
+def player_in_roster(roster, user_id):
     return any(
         int(player["user_id"]) == int(user_id)
         for player in roster
     )
 
 
-def format_roster(roster):
-    if not roster:
-        return "No players have joined yet."
+# ============================================================
+# PRIVATE SERVER LINK VALIDATION
+# ============================================================
 
-    lines = []
+def valid_private_server_link(link):
+    if not link:
+        return False
 
-    for index, player in enumerate(roster, start=1):
-        lines.append(
-            f"`{index}.` <@{player['user_id']}>"
+    try:
+        parsed = urlparse(link.strip())
+
+        if parsed.scheme != "https":
+            return False
+
+        if parsed.hostname not in (
+            "www.roblox.com",
+            "roblox.com",
+        ):
+            return False
+
+        query = parse_qs(parsed.query)
+
+        return (
+            bool(query.get("privateServerLinkCode"))
+            or (
+                query.get("type", [""])[0].lower() == "server"
+                and bool(query.get("code"))
+            )
         )
 
-    return "\n".join(lines)
+    except (ValueError, AttributeError):
+        return False
 
 
-def get_match_role_mention(mode):
+# ============================================================
+# MATCH EMBEDS
+# ============================================================
+
+def role_mention(mode):
     role_id = MATCH_ROLE_IDS.get(mode)
 
-    if not role_id:
-        return ""
-
-    return f"<@&{role_id}>"
+    return f"<@&{role_id}>" if role_id else ""
 
 
-# ============================================================
-# MATCH DATABASE HELPERS
-# ============================================================
-
-
-def create_match(
-    guild_id,
-    channel_id,
-    host_id,
-    mode,
-    region,
-    private_server_link,
-):
-    created_at = now_iso()
-
-    roster = [{
-        "user_id": int(host_id),
-    }]
-
-    with db_connect() as conn:
-        cursor = conn.execute("""
-            INSERT INTO matches (
-                guild_id,
-                channel_id,
-                host_id,
-                mode,
-                region,
-                status,
-                roster,
-                created_at,
-                last_reminder_at,
-                private_server_link
-            )
-            VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
-        """, (
-            guild_id,
-            channel_id,
-            host_id,
-            mode,
-            region,
-            json.dumps(roster),
-            created_at,
-            created_at,
-            private_server_link,
-        ))
-
-        return cursor.lastrowid
-
-
-
-def update_match_status(match_id, status):
-    with db_connect() as conn:
-        conn.execute("""
-            UPDATE matches
-            SET status = ?
-            WHERE id = ?
-        """, (status, match_id))
-
-
-def update_match_message(match_id, message_id):
-    with db_connect() as conn:
-        conn.execute("""
-            UPDATE matches
-            SET message_id = ?
-            WHERE id = ?
-        """, (message_id, match_id))
-
-
-def get_open_matches():
-    with db_connect() as conn:
-        rows = conn.execute("""
-            SELECT *
-            FROM matches
-            WHERE status = 'open'
-        """).fetchall()
-
-    return [dict(row) for row in rows]
-
-
-# ============================================================
-# RESULT PARSING
-# ============================================================
-
-def parse_result_message(content, roster, mode):
-    """
-    Expected format:
-
-    <@123456789> red 32
-    <@987654321> blue 25
-
-    Every player must be listed exactly once.
-    The bot calculates the team totals and determines the winner.
-    """
-
-    if not roster:
-        raise ValueError("This match has no players.")
-
-    expected_players = {
-        int(player["user_id"])
-        for player in roster
-    }
-
-    entries = {}
-    lines = [
-        line.strip()
-        for line in content.splitlines()
-        if line.strip()
-    ]
-
-    pattern = re.compile(
-        r"^<@!?(\d+)>\s+(red|blue)\s+(\d+)$",
-        re.IGNORECASE,
-    )
-
-    for line in lines:
-        match = pattern.match(line)
-
-        if not match:
-            continue
-
-        user_id = int(match.group(1))
-        team = match.group(2).lower()
-        score = int(match.group(3))
-
-        if user_id not in expected_players:
-            raise ValueError(
-                f"<@{user_id}> is not part of this match."
-            )
-
-        if user_id in entries:
-            raise ValueError(
-                f"<@{user_id}> was entered more than once."
-            )
-
-        entries[user_id] = {
-            "user_id": user_id,
-            "team": team,
-            "score": score,
-        }
-
-    missing_players = expected_players - set(entries)
-
-    if missing_players:
-        missing = ", ".join(
-            f"<@{user_id}>"
-            for user_id in sorted(missing_players)
-        )
-
-        raise ValueError(
-            f"Missing players: {missing}"
-        )
-
-    red_players = [
-        player for player in entries.values()
-        if player["team"] == "red"
-    ]
-
-    blue_players = [
-        player for player in entries.values()
-        if player["team"] == "blue"
-    ]
-
-    required_team_size = SLOT_COUNTS[mode] // 2
-
-    if len(red_players) != required_team_size:
-        raise ValueError(
-            f"Red team must have {required_team_size} players."
-        )
-
-    if len(blue_players) != required_team_size:
-        raise ValueError(
-            f"Blue team must have {required_team_size} players."
-        )
-
-    red_total = sum(
-        player["score"]
-        for player in red_players
-    )
-
-    blue_total = sum(
-        player["score"]
-        for player in blue_players
-    )
-
-    if red_total == blue_total:
-        raise ValueError(
-            "The team scores are tied. Please contact staff."
-        )
-
-    scores = {
-        "red": red_total,
-        "blue": blue_total,
-    }
-
-    players = list(entries.values())
-
-    winner = "red" if red_total > blue_total else "blue"
-
-    return {
-        "players": players,
-        "scores": scores,
-        "winner": winner,
-        "red_players": red_players,
-        "blue_players": blue_players,
-    }
-
-
-# ============================================================
-# MATCH EMBED
-# ============================================================
-
-def build_match_embed(match):
+def make_embed(match):
     roster = get_roster(match)
-    slots = get_mode_slots(match["mode"])
+
+    player_list = "\n".join(
+        f"`{index}.` <@{player['user_id']}>"
+        for index, player in enumerate(roster, 1)
+    )
+
+    if not player_list:
+        player_list = "No players yet."
 
     embed = discord.Embed(
         title="꒰ა・ARSENAL ANGELS HOST",
@@ -818,8 +406,8 @@ def build_match_embed(match):
     )
 
     embed.add_field(
-        name=f"Players ({len(roster)}/{slots})",
-        value=format_roster(roster),
+        name=f"Players ({len(roster)}/{SLOTS[match['mode']]})",
+        value=player_list,
         inline=False,
     )
 
@@ -836,116 +424,90 @@ def build_match_embed(match):
     return embed
 
 
-# ============================================================
-# RESULT MESSAGE FORMAT
-# ============================================================
+async def refresh_match_post(match_id):
+    match = get_match(match_id)
 
-def result_instructions(match):
-    roster = get_roster(match)
+    if not match or not match.get("message_id"):
+        return
 
-    player_lines = "\n".join(
-        f"<@{player['user_id']}> red 0"
-        for player in roster
-    )
+    channel = bot.get_channel(HOSTING_CHANNEL_ID)
 
-    return (
-        "꒰ა・**SUBMIT MATCH RESULTS**\n\n"
-        "Attach your match screenshot and list every player "
-        "with their team and individual points.\n\n"
-        "**Format:**\n"
-        "`@player red points`\n"
-        "`@player blue points`\n\n"
-        "**Example:**\n"
-        "```text\n"
-        f"{player_lines}\n"
-        "```\n"
-        "Use `red` or `blue` for each player's team. "
-        "The bot adds the points together to determine the winner.\n\n"
-        "Do not label players as winners or losers."
-    )
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(
+                HOSTING_CHANNEL_ID
+            )
+        except discord.HTTPException:
+            return
 
-
-# ============================================================
-# MATCH VALIDATION
-# ============================================================
-
-def validate_match_mode(mode):
-    if mode not in MODES:
-        raise ValueError("Invalid match mode.")
-
-    return mode
-
-
-def validate_region(region):
-    region = region.strip().upper()
-
-    if region not in REGIONS:
-        raise ValueError(
-            "Region must be NA, EU, OCE, or Other."
+    try:
+        message = await channel.fetch_message(
+            int(match["message_id"])
         )
 
-    return region
+        view = (
+            MatchView(
+                match_id,
+                match.get("private_server_link"),
+            )
+            if is_open(match)
+            else None
+        )
+
+        await message.edit(
+            embed=make_embed(match),
+            view=view,
+        )
+
+    except discord.HTTPException:
+        pass
 
 
-def can_edit_match(member, match):
-    return (
-        int(member.id) == int(match["host_id"])
-        or is_staff(member)
-    )
-
-
-def validate_open_match(match):
-    if not match:
-        raise ValueError("Match not found.")
-
-    if match["status"] != "open":
-        raise ValueError("This match is no longer open.")
-
-    return True# ============================================================
-# MATCH VIEW
+# ============================================================
+# MATCH BUTTONS
 # ============================================================
 
-
 class MatchView(discord.ui.View):
-    def __init__(self, match_id, private_server_link=None):
+
+    def __init__(self, match_id, private_server_link):
         super().__init__(timeout=None)
+
         self.match_id = match_id
 
-        # Add the private-server button when a link is provided.
-        if private_server_link:
-            self.add_item(
-                discord.ui.Button(
-                    label="Join Private Server",
-                    style=discord.ButtonStyle.link,
-                    url=private_server_link,
-                )
+        self.add_item(
+            discord.ui.Button(
+                label="Join Private Server",
+                style=discord.ButtonStyle.link,
+                url=private_server_link,
             )
+        )
 
-    async def refresh_message(self, interaction):
+    async def refresh(self, interaction):
         match = get_match(self.match_id)
 
         if not match:
             return
 
-        try:
-            await interaction.message.edit(
-                embed=build_match_embed(match),
-                view=self,
-            )
-        except (discord.NotFound, discord.HTTPException):
-            pass
+        await interaction.message.edit(
+            embed=make_embed(match),
+            view=MatchView(
+                self.match_id,
+                match["private_server_link"],
+            ),
+        )
 
     @discord.ui.button(
         label="Join Host",
         style=discord.ButtonStyle.success,
-        custom_id="hosting:join",
+        custom_id="aa:join",
     )
-    async def join_button(self, interaction, button):
+    async def join(self, interaction, button):
+
         match = get_match(self.match_id)
 
-        if not match or not match_is_open(match):
+        if not is_open(match):
             return await interaction.response.send_message(
-                "This host is no longer open.",
+                "This host is closed.",
                 ephemeral=True,
             )
 
@@ -954,54 +516,57 @@ class MatchView(discord.ui.View):
 
         roster = get_roster(match)
 
-        if member_in_roster(roster, interaction.user.id):
+        if player_in_roster(roster, interaction.user.id):
             return await interaction.response.send_message(
-                "You are already in this host.",
+                "You are already in this lobby.",
                 ephemeral=True,
             )
 
-        if len(roster) >= get_mode_slots(match["mode"]):
+        if len(roster) >= SLOTS[match["mode"]]:
             return await interaction.response.send_message(
-                "This host is full.",
+                "This lobby is full.",
                 ephemeral=True,
             )
 
-        roster.append({"user_id": interaction.user.id})
+        roster.append({
+            "user_id": interaction.user.id
+        })
+
         save_roster(self.match_id, roster)
 
         await interaction.response.send_message(
-            "You joined the host.",
+            "You joined the lobby.",
             ephemeral=True,
         )
 
-        await self.refresh_message(interaction)
+        await self.refresh(interaction)
 
     @discord.ui.button(
         label="Leave Host",
         style=discord.ButtonStyle.secondary,
-        custom_id="hosting:leave",
+        custom_id="aa:leave",
     )
-    async def leave_button(self, interaction, button):
+    async def leave(self, interaction, button):
+
         match = get_match(self.match_id)
 
-        if not match or not match_is_open(match):
+        if not is_open(match):
             return await interaction.response.send_message(
-                "This host is no longer open.",
+                "This host is closed.",
+                ephemeral=True,
+            )
+
+        if interaction.user.id == int(match["host_id"]):
+            return await interaction.response.send_message(
+                "The host cannot leave their own lobby. Cancel it instead.",
                 ephemeral=True,
             )
 
         roster = get_roster(match)
 
-        if interaction.user.id == int(match["host_id"]):
+        if not player_in_roster(roster, interaction.user.id):
             return await interaction.response.send_message(
-                "The host cannot leave their own lobby. "
-                "Use Cancel Host instead.",
-                ephemeral=True,
-            )
-
-        if not member_in_roster(roster, interaction.user.id):
-            return await interaction.response.send_message(
-                "You are not in this host.",
+                "You are not in this lobby.",
                 ephemeral=True,
             )
 
@@ -1013,23 +578,24 @@ class MatchView(discord.ui.View):
         save_roster(self.match_id, roster)
 
         await interaction.response.send_message(
-            "You left the host.",
+            "You left the lobby.",
             ephemeral=True,
         )
 
-        await self.refresh_message(interaction)
+        await self.refresh(interaction)
 
     @discord.ui.button(
         label="Post Results",
         style=discord.ButtonStyle.primary,
-        custom_id="hosting:results",
+        custom_id="aa:results",
     )
-    async def results_button(self, interaction, button):
+    async def results(self, interaction, button):
+
         match = get_match(self.match_id)
 
-        if not match or not match_is_open(match):
+        if not is_open(match):
             return await interaction.response.send_message(
-                "This match is no longer open.",
+                "This match is closed.",
                 ephemeral=True,
             )
 
@@ -1039,9 +605,9 @@ class MatchView(discord.ui.View):
                 ephemeral=True,
             )
 
-        if not roster_is_full(match):
+        if not is_full(match):
             return await interaction.response.send_message(
-                "The lobby must be full before submitting results.",
+                "The lobby must be full first.",
                 ephemeral=True,
             )
 
@@ -1050,19 +616,26 @@ class MatchView(discord.ui.View):
         ] = self.match_id
 
         await interaction.response.send_message(
-            result_instructions(match),
+            "Attach your match screenshot and send each player's "
+            "team and points in this format:\n\n"
+            "```text\n"
+            "<@PLAYER_ID> red 32\n"
+            "<@PLAYER_ID> blue 25\n"
+            "```\n"
+            "Use red or blue for the team.",
             ephemeral=True,
         )
 
     @discord.ui.button(
         label="Rehost",
         style=discord.ButtonStyle.secondary,
-        custom_id="hosting:rehost",
+        custom_id="aa:rehost",
     )
-    async def rehost_button(self, interaction, button):
+    async def rehost(self, interaction, button):
+
         match = get_match(self.match_id)
 
-        if not match or not match_is_open(match):
+        if not is_open(match):
             return await interaction.response.send_message(
                 "This match cannot be rehosted.",
                 ephemeral=True,
@@ -1074,70 +647,119 @@ class MatchView(discord.ui.View):
                 ephemeral=True,
             )
 
-        private_server_link = match.get("private_server_link")
-
         new_id = create_match(
-            guild_id=match["guild_id"],
-            channel_id=match["channel_id"],
-            host_id=interaction.user.id,
-            mode=match["mode"],
-            region=match["region"],
-            private_server_link=private_server_link,
+            match["guild_id"],
+            interaction.user.id,
+            match["mode"],
+            match["region"],
+            match["private_server_link"],
         )
 
         new_match = get_match(new_id)
-        view = MatchView(new_id, private_server_link)
 
-        message = await interaction.channel.send(
-            content=get_match_role_mention(match["mode"]),
-            embed=build_match_embed(new_match),
-            view=view,
+        channel = bot.get_channel(HOSTING_CHANNEL_ID)
+
+        if channel is None:
+            channel = await bot.fetch_channel(
+                HOSTING_CHANNEL_ID
+            )
+
+        message = await channel.send(
+            content=role_mention(match["mode"]),
+            embed=make_embed(new_match),
+            view=MatchView(
+                new_id,
+                match["private_server_link"],
+            ),
+            allowed_mentions=discord.AllowedMentions(
+                roles=True,
+                users=False,
+                everyone=False,
+            ),
         )
 
-        update_match_message(new_id, message.id)
+        update_message_id(new_id, message.id)
 
         await interaction.response.send_message(
-            f"New host created. Match ID: `{new_id}`",
+            f"New match created. ID: `{new_id}`",
             ephemeral=True,
         )
 
     @discord.ui.button(
         label="Cancel Host",
         style=discord.ButtonStyle.danger,
-        custom_id="hosting:cancel",
+        custom_id="aa:cancel",
     )
-    async def cancel_button(self, interaction, button):
+    async def cancel(self, interaction, button):
+
         match = get_match(self.match_id)
 
-        if not match or not match_is_open(match):
+        if not is_open(match):
             return await interaction.response.send_message(
-                "This host is already closed.",
+                "This lobby is already closed.",
                 ephemeral=True,
             )
 
         if not can_edit_match(interaction.user, match):
             return await interaction.response.send_message(
-                "Only the host or staff can cancel this host.",
+                "Only the host or staff can cancel this lobby.",
                 ephemeral=True,
             )
 
         update_match_status(self.match_id, "cancelled")
 
         await interaction.response.send_message(
-            "Host cancelled.",
+            "Lobby cancelled.",
             ephemeral=True,
         )
 
-        closed_match = get_match(self.match_id)
+        await refresh_match_post(self.match_id)
 
-        try:
-            await interaction.message.edit(
-                embed=build_match_embed(closed_match),
-                view=None,
-            )
-        except discord.HTTPException:
-            pass
 
+# ============================================================
+# BOT SETUP
+# ============================================================
+
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.messages = True
+intents.message_content = True
+
+
+class ArsenalAngelsBot(commands.Bot):
+
+    async def setup_hook(self):
+        init_db()
+
+        # Register persistent button callbacks after restart.
+        for match in get_open_matches():
+
+            if match.get("message_id"):
+
+                self.add_view(
+                    MatchView(
+                        match["id"],
+                        match["private_server_link"],
+                    ),
+                    message_id=int(match["message_id"]),
+                )
+
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+
+            self.tree.copy_global_to(guild=guild)
+
+            await self.tree.sync(guild=guild)
+
+        else:
+            await self.tree.sync()
+
+
+bot = ArsenalAngelsBot(
+    command_prefix="!",
+    intents=intents,
+)
 
 
 # ============================================================
@@ -1146,11 +768,12 @@ class MatchView(discord.ui.View):
 
 @bot.tree.command(
     name="host",
-    description="Create an Arsenal Angels match host.",
+    description="Create an Arsenal Angels match.",
 )
 @app_commands.describe(
-    mode="Choose the match size.",
-    region="Choose the region.",
+    mode="Match size.",
+    region="Match region.",
+    private_server_link="Required Roblox private-server link.",
 )
 @app_commands.choices(
     mode=[
@@ -1165,51 +788,125 @@ class MatchView(discord.ui.View):
         app_commands.Choice(name="Other", value="Other"),
     ],
 )
-
-@app_commands.command(name="host", description="Host an Arsenal match")
-@app_commands.describe(
-    mode="Choose the match size.",
-    region="Choose the region.",
-    private_server_link="Required Roblox private-server link.",
-)
 async def host_command(
     interaction: discord.Interaction,
     mode: app_commands.Choice[str],
     region: app_commands.Choice[str],
     private_server_link: str,
 ):
+
     if not await require_verified(interaction):
         return
 
-    if not await require_host(interaction):
-        return
-
-    if not valid_private_server_link(private_server_link):
+    if not can_host(interaction.user):
         return await interaction.response.send_message(
-            "Please provide a valid Roblox private-server link.",
+            "You do not have permission to host.",
             ephemeral=True,
         )
 
+    private_server_link = private_server_link.strip()
+
+    if not valid_private_server_link(private_server_link):
+        return await interaction.response.send_message(
+            "You must provide a valid Roblox private-server link.",
+            ephemeral=True,
+        )
+
+    channel = bot.get_channel(HOSTING_CHANNEL_ID)
+
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(
+                HOSTING_CHANNEL_ID
+            )
+        except discord.HTTPException:
+            return await interaction.response.send_message(
+                "I cannot access the hosting channel.",
+                ephemeral=True,
+            )
+
     match_id = create_match(
-        guild_id=interaction.guild_id,
-        channel_id=interaction.channel_id,
-        host_id=interaction.user.id,
-        mode=mode.value,
-        region=region.value,
-        private_server_link=private_server_link,
+        interaction.guild_id,
+        interaction.user.id,
+        mode.value,
+        region.value,
+        private_server_link,
     )
 
     match = get_match(match_id)
-    view = MatchView(match_id, private_server_link)
+
+    try:
+        message = await channel.send(
+            content=role_mention(mode.value),
+            embed=make_embed(match),
+            view=MatchView(
+                match_id,
+                private_server_link,
+            ),
+            allowed_mentions=discord.AllowedMentions(
+                roles=True,
+                users=False,
+                everyone=False,
+            ),
+        )
+
+        update_message_id(match_id, message.id)
+
+    except discord.HTTPException:
+
+        update_match_status(match_id, "cancelled")
+
+        return await interaction.response.send_message(
+            "Could not post the lobby. Check the bot's channel permissions.",
+            ephemeral=True,
+        )
 
     await interaction.response.send_message(
-        content=get_match_role_mention(mode.value),
-        embed=build_match_embed(match),
-        view=view,
+        f"Your lobby was posted in {channel.mention}. "
+        f"Match ID: `{match_id}`",
+        ephemeral=True,
     )
 
-    message = await interaction.original_response()
-    update_match_message(match_id, message.id)
+
+# ============================================================
+# CANCEL COMMAND
+# ============================================================
+
+@bot.tree.command(
+    name="cancel",
+    description="Cancel an open match by match ID.",
+)
+@app_commands.describe(
+    match_id="The match ID to cancel."
+)
+async def cancel_command(
+    interaction: discord.Interaction,
+    match_id: int,
+):
+
+    match = get_match(match_id)
+
+    if not is_open(match):
+        return await interaction.response.send_message(
+            "Match not found or already closed.",
+            ephemeral=True,
+        )
+
+    if not can_edit_match(interaction.user, match):
+        return await interaction.response.send_message(
+            "Only the host or staff can cancel this match.",
+            ephemeral=True,
+        )
+
+    update_match_status(match_id, "cancelled")
+
+    await refresh_match_post(match_id)
+
+    await interaction.response.send_message(
+        f"Match `{match_id}` cancelled.",
+        ephemeral=True,
+    )
+
 
 # ============================================================
 # KICK PLAYER
@@ -1217,22 +914,23 @@ async def host_command(
 
 @bot.tree.command(
     name="kickplayer",
-    description="Remove a player from an open host.",
+    description="Remove a player from a lobby.",
 )
 @app_commands.describe(
-    match_id="The match ID.",
-    player="The player to remove.",
+    match_id="Match ID.",
+    player="Player to remove.",
 )
 async def kickplayer_command(
     interaction: discord.Interaction,
     match_id: int,
     player: discord.Member,
 ):
+
     match = get_match(match_id)
 
-    if not match or not match_is_open(match):
+    if not is_open(match):
         return await interaction.response.send_message(
-            "That match is not open.",
+            "Match is not open.",
             ephemeral=True,
         )
 
@@ -1244,30 +942,31 @@ async def kickplayer_command(
 
     if player.id == int(match["host_id"]):
         return await interaction.response.send_message(
-            "The host cannot be kicked from their own lobby.",
+            "The host cannot be removed.",
             ephemeral=True,
         )
 
     roster = get_roster(match)
 
-    if not member_in_roster(roster, player.id):
+    if not player_in_roster(roster, player.id):
         return await interaction.response.send_message(
-            "That player is not in this lobby.",
+            "That player is not in the lobby.",
             ephemeral=True,
         )
 
     roster = [
-        entry for entry in roster
-        if int(entry["user_id"]) != player.id
+        p for p in roster
+        if int(p["user_id"]) != player.id
     ]
 
     save_roster(match_id, roster)
 
-    await interaction.response.send_message(
-        f"Removed {player.mention} from match `{match_id}`.",
-    )
-
     await refresh_match_post(match_id)
+
+    await interaction.response.send_message(
+        f"Removed {player.mention}.",
+        ephemeral=True,
+    )
 
 
 # ============================================================
@@ -1276,12 +975,12 @@ async def kickplayer_command(
 
 @bot.tree.command(
     name="subplayer",
-    description="Replace a player in an open host.",
+    description="Replace a player in a lobby.",
 )
 @app_commands.describe(
-    match_id="The match ID.",
-    outgoing="The player being replaced.",
-    incoming="The substitute player.",
+    match_id="Match ID.",
+    outgoing="Player being replaced.",
+    incoming="Substitute player.",
 )
 async def subplayer_command(
     interaction: discord.Interaction,
@@ -1289,11 +988,12 @@ async def subplayer_command(
     outgoing: discord.Member,
     incoming: discord.Member,
 ):
+
     match = get_match(match_id)
 
-    if not match or not match_is_open(match):
+    if not is_open(match):
         return await interaction.response.send_message(
-            "That match is not open.",
+            "Match is not open.",
             ephemeral=True,
         )
 
@@ -1309,12 +1009,6 @@ async def subplayer_command(
             ephemeral=True,
         )
 
-    if incoming.id == int(match["host_id"]):
-        return await interaction.response.send_message(
-            "The host is already in the lobby.",
-            ephemeral=True,
-        )
-
     if not is_verified(incoming):
         return await interaction.response.send_message(
             "The substitute must be verified.",
@@ -1323,79 +1017,378 @@ async def subplayer_command(
 
     roster = get_roster(match)
 
-    if not member_in_roster(roster, outgoing.id):
+    if not player_in_roster(roster, outgoing.id):
         return await interaction.response.send_message(
-            "The outgoing player is not in this lobby.",
+            "The outgoing player is not in the lobby.",
             ephemeral=True,
         )
 
-    if member_in_roster(roster, incoming.id):
+    if player_in_roster(roster, incoming.id):
         return await interaction.response.send_message(
-            "The substitute is already in this lobby.",
+            "The substitute is already in the lobby.",
             ephemeral=True,
         )
 
-    for entry in roster:
-        if int(entry["user_id"]) == outgoing.id:
-            entry["user_id"] = incoming.id
+    for player in roster:
+
+        if int(player["user_id"]) == outgoing.id:
+            player["user_id"] = incoming.id
             break
 
     save_roster(match_id, roster)
 
-    await interaction.response.send_message(
-        f"{outgoing.mention} was replaced by {incoming.mention}.",
-    )
-
     await refresh_match_post(match_id)
 
+    await interaction.response.send_message(
+        f"{outgoing.mention} was replaced by {incoming.mention}.",
+        ephemeral=True,
+    )
+
 
 # ============================================================
-# REFRESH MATCH POST
+# ELO FUNCTIONS
 # ============================================================
 
-async def refresh_match_post(match_id):
-    match = get_match(match_id)
+def ensure_rating(conn, guild_id, user_id, mode):
 
-    if not match or not match.get("message_id"):
-        return
+    conn.execute("""
+        INSERT OR IGNORE INTO ratings
+        (guild_id, user_id, mode, elo, wins, losses, matches)
+        VALUES (?, ?, ?, ?, 0, 0, 0)
+    """, (
+        guild_id,
+        user_id,
+        mode,
+        STARTING_ELO,
+    ))
 
-    channel = bot.get_channel(int(match["channel_id"]))
+    return conn.execute("""
+        SELECT * FROM ratings
+        WHERE guild_id = ? AND user_id = ? AND mode = ?
+    """, (
+        guild_id,
+        user_id,
+        mode,
+    )).fetchone()
 
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(
-                int(match["channel_id"])
+
+def get_rating(guild_id, user_id, mode):
+
+    with db_connect() as conn:
+
+        row = ensure_rating(
+            conn,
+            guild_id,
+            user_id,
+            mode,
+        )
+
+        return dict(row)
+
+
+def expected_score(player_elo, opponent_elo):
+
+    return 1 / (
+        1 + 10 ** (
+            (opponent_elo - player_elo) / 400
+        )
+    )
+
+
+def calculate_changes(players, scores, guild_id, mode):
+
+    red = [
+        p for p in players
+        if p["team"] == "red"
+    ]
+
+    blue = [
+        p for p in players
+        if p["team"] == "blue"
+    ]
+
+    def average(team):
+
+        if not team:
+            return STARTING_ELO
+
+        return sum(
+            get_rating(
+                guild_id,
+                p["user_id"],
+                mode,
+            )["elo"]
+            for p in team
+        ) / len(team)
+
+    red_average = average(red)
+    blue_average = average(blue)
+
+    red_score_average = sum(
+        p["score"] for p in red
+    ) / len(red)
+
+    blue_score_average = sum(
+        p["score"] for p in blue
+    ) / len(blue)
+
+    red_won = scores["red"] > scores["blue"]
+
+    changes = {}
+
+    for player in players:
+
+        is_red = player["team"] == "red"
+
+        team_elo = (
+            red_average if is_red
+            else blue_average
+        )
+
+        opponent_elo = (
+            blue_average if is_red
+            else red_average
+        )
+
+        won = (
+            red_won if is_red
+            else not red_won
+        )
+
+        team_average_score = (
+            red_score_average if is_red
+            else blue_score_average
+        )
+
+        actual = 1 if won else 0
+
+        result_component = (
+            0.70 * K_FACTOR
+            * (
+                actual
+                - expected_score(team_elo, opponent_elo)
             )
-        except discord.HTTPException:
-            return
-
-    try:
-        message = await channel.fetch_message(
-            int(match["message_id"])
         )
 
-        view = MatchView(match_id) if match_is_open(match) else None
+        performance = (
+            player["score"] - team_average_score
+        ) / max(10, team_average_score)
 
-        await message.edit(
-            embed=build_match_embed(match),
-            view=view,
+        performance = max(
+            -1,
+            min(1, performance),
         )
-    except discord.HTTPException:
-        pass
+
+        performance_component = (
+            0.20 * K_FACTOR * performance
+        )
+
+        difficulty = (
+            opponent_elo - team_elo
+        ) / 400
+
+        difficulty = max(
+            -1,
+            min(1, difficulty),
+        )
+
+        difficulty_component = (
+            0.10 * K_FACTOR * difficulty
+        )
+
+        delta = round(
+            result_component
+            + performance_component
+            + difficulty_component
+        )
+
+        if won:
+            delta = max(1, delta)
+        else:
+            delta = min(-1, delta)
+
+        changes[player["user_id"]] = {
+            "delta": delta,
+            "won": won,
+            "score": player["score"],
+        }
+
+    return changes
+
+
+def apply_result(match_id, guild_id, mode, players, scores):
+
+    changes = calculate_changes(
+        players,
+        scores,
+        guild_id,
+        mode,
+    )
+
+    old_values = {}
+
+    with db_connect() as conn:
+
+        existing = conn.execute(
+            "SELECT id FROM elo_matches WHERE hosting_match_id = ?",
+            (match_id,),
+        ).fetchone()
+
+        if existing:
+            raise ValueError(
+                "ELO has already been applied to this match."
+            )
+
+        for user_id, result in changes.items():
+
+            old = ensure_rating(
+                conn,
+                guild_id,
+                user_id,
+                mode,
+            )
+
+            old_values[str(user_id)] = dict(old)
+
+            conn.execute("""
+                UPDATE ratings
+                SET elo = elo + ?,
+                    wins = wins + ?,
+                    losses = losses + ?,
+                    matches = matches + 1
+                WHERE guild_id = ?
+                AND user_id = ?
+                AND mode = ?
+            """, (
+                result["delta"],
+                int(result["won"]),
+                int(not result["won"]),
+                guild_id,
+                user_id,
+                mode,
+            ))
+
+        data = {
+            "old_values": old_values,
+            "changes": {
+                str(uid): result
+                for uid, result in changes.items()
+            },
+            "scores": scores,
+        }
+
+        conn.execute("""
+            INSERT INTO elo_matches
+            (hosting_match_id, guild_id, mode, result_data, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            match_id,
+            guild_id,
+            mode,
+            json.dumps(data),
+            now_iso(),
+        ))
+
+    return changes
 
 
 # ============================================================
 # MATCH RESULT SUBMISSION
 # ============================================================
 
+def parse_results(content, roster, mode):
+
+    expected_ids = {
+        int(p["user_id"])
+        for p in roster
+    }
+
+    entries = {}
+
+    pattern = re.compile(
+        r"^<@!?(\d+)>\s+(red|blue)\s+(\d+)$",
+        re.I,
+    )
+
+    for line in content.splitlines():
+
+        found = pattern.match(line.strip())
+
+        if not found:
+            continue
+
+        user_id = int(found.group(1))
+        team = found.group(2).lower()
+        score = int(found.group(3))
+
+        if user_id not in expected_ids:
+            raise ValueError(
+                f"<@{user_id}> is not in this match."
+            )
+
+        if user_id in entries:
+            raise ValueError(
+                f"<@{user_id}> was entered twice."
+            )
+
+        entries[user_id] = {
+            "user_id": user_id,
+            "team": team,
+            "score": score,
+        }
+
+    missing = expected_ids - set(entries)
+
+    if missing:
+        raise ValueError(
+            "Missing players: "
+            + ", ".join(
+                f"<@{uid}>" for uid in missing
+            )
+        )
+
+    team_size = SLOTS[mode] // 2
+
+    red = [
+        p for p in entries.values()
+        if p["team"] == "red"
+    ]
+
+    blue = [
+        p for p in entries.values()
+        if p["team"] == "blue"
+    ]
+
+    if len(red) != team_size or len(blue) != team_size:
+        raise ValueError(
+            f"Each team needs {team_size} players."
+        )
+
+    scores = {
+        "red": sum(p["score"] for p in red),
+        "blue": sum(p["score"] for p in blue),
+    }
+
+    if scores["red"] == scores["blue"]:
+        raise ValueError(
+            "The team scores are tied. Contact staff."
+        )
+
+    return list(entries.values()), scores
+
+
 @bot.event
 async def on_message(message):
+
     if message.author.bot:
         return
 
-    match_id = pending_results.get(
-        (message.channel.id, message.author.id)
+    key = (
+        message.channel.id,
+        message.author.id,
     )
+
+    match_id = pending_results.get(key)
 
     if match_id is None:
         await bot.process_commands(message)
@@ -1403,13 +1396,10 @@ async def on_message(message):
 
     match = get_match(match_id)
 
-    if not match or not match_is_open(match):
-        pending_results.pop(
-            (message.channel.id, message.author.id),
-            None,
-        )
+    if not is_open(match):
+        pending_results.pop(key, None)
         return await message.reply(
-            "This match is no longer open."
+            "This match is closed."
         )
 
     if not can_edit_match(message.author, match):
@@ -1419,10 +1409,10 @@ async def on_message(message):
 
     if not message.attachments:
         return await message.reply(
-            "Please attach the match screenshot with your result."
+            "Please attach a match screenshot."
         )
 
-    image_attachment = next(
+    screenshot = next(
         (
             attachment
             for attachment in message.attachments
@@ -1432,146 +1422,141 @@ async def on_message(message):
         None,
     )
 
-    if image_attachment is None:
+    if screenshot is None:
         return await message.reply(
-            "The attachment must be an image screenshot."
+            "Your attachment must be an image."
         )
-
-    if match_id in processing_matches:
-        return await message.reply(
-            "This result is already being processed."
-        )
-
-    processing_matches.add(match_id)
 
     try:
-        parsed = parse_result_message(
+
+        players, scores = parse_results(
             message.content,
             get_roster(match),
             match["mode"],
         )
 
-        changes = apply_elo_result(
-            hosting_match_id=match_id,
-            guild_id=match["guild_id"],
-            mode=mode_to_elo_mode(match["mode"]),
-            players=parsed["players"],
-            scores=parsed["scores"],
+        mode = match["mode"].removesuffix("s")
+
+        changes = apply_result(
+            match_id,
+            match["guild_id"],
+            mode,
+            players,
+            scores,
         )
-
-        result_channel = bot.get_channel(
-            MATCH_RESULTS_CHANNEL_ID
-        )
-
-        if result_channel is None and MATCH_RESULTS_CHANNEL_ID:
-            try:
-                result_channel = await bot.fetch_channel(
-                    MATCH_RESULTS_CHANNEL_ID
-                )
-            except discord.HTTPException:
-                result_channel = None
-
-        winner = parsed["winner"]
 
         embed = discord.Embed(
-            title="꒰ა・MATCH RESULT",
+            title="꒰ა・MATCH RESULTS",
             color=discord.Color.from_rgb(255, 160, 200),
         )
 
         embed.add_field(
             name="Red Team",
-            value=f"**{parsed['scores']['red']} points**",
+            value=str(scores["red"]),
             inline=True,
         )
 
         embed.add_field(
             name="Blue Team",
-            value=f"**{parsed['scores']['blue']} points**",
+            value=str(scores["blue"]),
             inline=True,
         )
 
-        embed.add_field(
-            name="Winner",
-            value=winner.title(),
-            inline=False,
-        )
-
-        change_lines = []
+        lines = []
 
         for user_id, result in changes.items():
-            sign = "+" if result["delta"] >= 0 else ""
 
-            change_lines.append(
-                f"<@{user_id}>: {sign}{result['delta']} ELO"
+            sign = (
+                "+" if result["delta"] > 0
+                else ""
+            )
+
+            lines.append(
+                f"<@{user_id}> — {sign}{result['delta']} ELO"
             )
 
         embed.add_field(
             name="ELO Changes",
-            value="\n".join(change_lines),
+            value="\n".join(lines),
             inline=False,
         )
 
-        embed.set_image(url=image_attachment.url)
+        embed.set_image(url=screenshot.url)
 
-        if result_channel:
-            await result_channel.send(embed=embed)
+        if RESULTS_CHANNEL_ID:
 
-        update_match_status(match_id, "completed")
+            channel = bot.get_channel(
+                RESULTS_CHANNEL_ID
+            )
 
-        pending_results.pop(
-            (message.channel.id, message.author.id),
-            None,
+            if channel is None:
+                channel = await bot.fetch_channel(
+                    RESULTS_CHANNEL_ID
+                )
+
+            await channel.send(embed=embed)
+
+        update_match_status(
+            match_id,
+            "completed",
         )
 
+        pending_results.pop(key, None)
+
         await message.reply(
-            "Results submitted successfully. ELO has been updated."
+            "Results submitted. ELO has been updated."
         )
 
         await refresh_match_post(match_id)
 
     except ValueError as error:
+
         await message.reply(
             f"Could not process results: {error}"
         )
 
     except Exception:
+
         await message.reply(
-            "An unexpected error occurred while processing results. "
-            "Please contact staff."
+            "An unexpected error occurred. Contact staff."
         )
+
         raise
 
-    finally:
-        processing_matches.discard(match_id)
+    await bot.process_commands(message)
 
-    await bot.process_commands(message)# ============================================================
+
+# ============================================================
 # ELO COMMANDS
 # ============================================================
 
+ELO_CHOICES = [
+    app_commands.Choice(name="1v1", value="1v1"),
+    app_commands.Choice(name="2v2", value="2v2"),
+    app_commands.Choice(name="3v3", value="3v3"),
+]
+
+
 @bot.tree.command(
     name="elo",
-    description="Check your ELO rating.",
+    description="Check a player's ELO.",
 )
 @app_commands.describe(
-    mode="Choose the ELO category.",
-    member="Optional player to check.",
+    mode="ELO category.",
+    member="Optional player.",
 )
-@app_commands.choices(
-    mode=[
-        app_commands.Choice(name="1v1", value="1v1"),
-        app_commands.Choice(name="2v2", value="2v2"),
-        app_commands.Choice(name="3v3", value="3v3"),
-    ],
-)
+@app_commands.choices(mode=ELO_CHOICES)
 async def elo_command(
     interaction: discord.Interaction,
     mode: app_commands.Choice[str],
     member: discord.Member = None,
 ):
+
     if not await require_verified(interaction):
         return
 
     target = member or interaction.user
+
     rating = get_rating(
         interaction.guild_id,
         target.id,
@@ -1610,37 +1595,29 @@ async def elo_command(
         inline=False,
     )
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(
+        embed=embed
+    )
 
-
-# ============================================================
-# LEADERBOARD
-# ============================================================
 
 @bot.tree.command(
     name="leaderboard",
     description="View the ELO leaderboard.",
 )
-@app_commands.describe(
-    mode="Choose the ELO category.",
-)
-@app_commands.choices(
-    mode=[
-        app_commands.Choice(name="1v1", value="1v1"),
-        app_commands.Choice(name="2v2", value="2v2"),
-        app_commands.Choice(name="3v3", value="3v3"),
-    ],
-)
+@app_commands.describe(mode="ELO category.")
+@app_commands.choices(mode=ELO_CHOICES)
 async def leaderboard_command(
     interaction: discord.Interaction,
     mode: app_commands.Choice[str],
 ):
+
     if not await require_verified(interaction):
         return
 
     with db_connect() as conn:
+
         rows = conn.execute("""
-            SELECT user_id, elo, wins, losses, matches
+            SELECT user_id, elo, wins, losses
             FROM ratings
             WHERE guild_id = ? AND mode = ?
             ORDER BY elo DESC
@@ -1652,16 +1629,17 @@ async def leaderboard_command(
 
     if not rows:
         return await interaction.response.send_message(
-            "There are no ratings for this mode yet.",
+            "No ratings exist for this mode yet.",
             ephemeral=True,
         )
 
     lines = []
 
-    for position, row in enumerate(rows, start=1):
+    for index, row in enumerate(rows, 1):
+
         lines.append(
-            f"`{position}.` <@{row['user_id']}> — "
-            f"**{row['elo']} ELO** "
+            f"`{index}.` <@{row['user_id']}> — "
+            f"{row['elo']} ELO "
             f"({row['wins']}W / {row['losses']}L)"
         )
 
@@ -1671,30 +1649,97 @@ async def leaderboard_command(
         color=discord.Color.from_rgb(255, 160, 200),
     )
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(
+        embed=embed
+    )
 
 
 # ============================================================
-# ADD ELO
+# MANUAL ELO ADJUSTMENTS
 # ============================================================
+
+async def adjust_elo(
+    interaction,
+    member,
+    mode,
+    amount,
+    reason,
+    adding,
+):
+
+    if not can_manage_elo(interaction.user):
+        return await interaction.response.send_message(
+            "You cannot manage ELO.",
+            ephemeral=True,
+        )
+
+    with db_connect() as conn:
+
+        rating = ensure_rating(
+            conn,
+            interaction.guild_id,
+            member.id,
+            mode,
+        )
+
+        if adding:
+            new_elo = rating["elo"] + amount
+            actual = amount
+
+        else:
+            new_elo = max(
+                0,
+                rating["elo"] - amount,
+            )
+
+            actual = new_elo - rating["elo"]
+
+        conn.execute("""
+            UPDATE ratings
+            SET elo = ?
+            WHERE guild_id = ?
+            AND user_id = ?
+            AND mode = ?
+        """, (
+            new_elo,
+            interaction.guild_id,
+            member.id,
+            mode,
+        ))
+
+        conn.execute("""
+            INSERT INTO elo_adjustments
+            (guild_id, user_id, mode, amount, reason, staff_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            interaction.guild_id,
+            member.id,
+            mode,
+            actual,
+            reason,
+            interaction.user.id,
+            now_iso(),
+        ))
+
+    action = "Added" if adding else "Removed"
+
+    await interaction.response.send_message(
+        f"{action} {abs(actual)} ELO for {member.mention} "
+        f"in {mode.upper()}.\nReason: {reason}"
+    )
+
 
 @bot.tree.command(
     name="addelo",
-    description="Manually add ELO to a player.",
+    description="Add ELO to a player.",
 )
 @app_commands.describe(
-    member="Player receiving ELO.",
+    member="Player.",
     mode="ELO category.",
     amount="Amount to add.",
-    reason="Reason for the adjustment.",
+    reason="Reason for adjustment.",
 )
-@app_commands.choices(
-    mode=[
-        app_commands.Choice(name="1v1", value="1v1"),
-        app_commands.Choice(name="2v2", value="2v2"),
-        app_commands.Choice(name="3v3", value="3v3"),
-    ],
-)
+@app_commands.choices(mode=ELO_CHOICES)
 async def addelo_command(
     interaction: discord.Interaction,
     member: discord.Member,
@@ -1702,79 +1747,28 @@ async def addelo_command(
     amount: app_commands.Range[int, 1, 10000],
     reason: str = "Staff adjustment",
 ):
-    if not can_manage_elo(interaction.user):
-        return await interaction.response.send_message(
-            "You do not have permission to manage ELO.",
-            ephemeral=True,
-        )
 
-    with db_connect() as conn:
-        ensure_rating(
-            conn,
-            interaction.guild_id,
-            member.id,
-            mode.value,
-        )
-
-        conn.execute("""
-            UPDATE ratings
-            SET elo = elo + ?
-            WHERE guild_id = ? AND user_id = ? AND mode = ?
-        """, (
-            amount,
-            interaction.guild_id,
-            member.id,
-            mode.value,
-        ))
-
-        conn.execute("""
-            INSERT INTO elo_adjustments (
-                guild_id,
-                user_id,
-                mode,
-                amount,
-                reason,
-                staff_id,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            interaction.guild_id,
-            member.id,
-            mode.value,
-            amount,
-            reason,
-            interaction.user.id,
-            now_iso(),
-        ))
-
-    await interaction.response.send_message(
-        f"Added **{amount} ELO** to {member.mention} "
-        f"in {mode.value.upper()}.\nReason: {reason}"
+    await adjust_elo(
+        interaction,
+        member,
+        mode.value,
+        amount,
+        reason,
+        True,
     )
 
 
-# ============================================================
-# REMOVE ELO
-# ============================================================
-
 @bot.tree.command(
     name="removeelo",
-    description="Manually remove ELO from a player.",
+    description="Remove ELO from a player.",
 )
 @app_commands.describe(
-    member="Player losing ELO.",
+    member="Player.",
     mode="ELO category.",
     amount="Amount to remove.",
-    reason="Reason for the adjustment.",
+    reason="Reason for adjustment.",
 )
-@app_commands.choices(
-    mode=[
-        app_commands.Choice(name="1v1", value="1v1"),
-        app_commands.Choice(name="2v2", value="2v2"),
-        app_commands.Choice(name="3v3", value="3v3"),
-    ],
-)
+@app_commands.choices(mode=ELO_CHOICES)
 async def removeelo_command(
     interaction: discord.Interaction,
     member: discord.Member,
@@ -1782,58 +1776,14 @@ async def removeelo_command(
     amount: app_commands.Range[int, 1, 10000],
     reason: str = "Staff adjustment",
 ):
-    if not can_manage_elo(interaction.user):
-        return await interaction.response.send_message(
-            "You do not have permission to manage ELO.",
-            ephemeral=True,
-        )
 
-    with db_connect() as conn:
-        rating = ensure_rating(
-            conn,
-            interaction.guild_id,
-            member.id,
-            mode.value,
-        )
-
-        new_elo = max(0, rating["elo"] - amount)
-        actual_removed = rating["elo"] - new_elo
-
-        conn.execute("""
-            UPDATE ratings
-            SET elo = ?
-            WHERE guild_id = ? AND user_id = ? AND mode = ?
-        """, (
-            new_elo,
-            interaction.guild_id,
-            member.id,
-            mode.value,
-        ))
-
-        conn.execute("""
-            INSERT INTO elo_adjustments (
-                guild_id,
-                user_id,
-                mode,
-                amount,
-                reason,
-                staff_id,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            interaction.guild_id,
-            member.id,
-            mode.value,
-            -actual_removed,
-            reason,
-            interaction.user.id,
-            now_iso(),
-        ))
-
-    await interaction.response.send_message(
-        f"Removed **{actual_removed} ELO** from {member.mention} "
-        f"in {mode.value.upper()}.\nReason: {reason}"
+    await adjust_elo(
+        interaction,
+        member,
+        mode.value,
+        amount,
+        reason,
+        False,
     )
 
 
@@ -1843,30 +1793,26 @@ async def removeelo_command(
 
 @bot.tree.command(
     name="matchhistory",
-    description="View a player's recent ELO matches.",
+    description="View a player's recent match history.",
 )
 @app_commands.describe(
-    member="Player to check. Leave blank for yourself.",
     mode="ELO category.",
+    member="Optional player.",
 )
-@app_commands.choices(
-    mode=[
-        app_commands.Choice(name="1v1", value="1v1"),
-        app_commands.Choice(name="2v2", value="2v2"),
-        app_commands.Choice(name="3v3", value="3v3"),
-    ],
-)
+@app_commands.choices(mode=ELO_CHOICES)
 async def matchhistory_command(
     interaction: discord.Interaction,
     mode: app_commands.Choice[str],
     member: discord.Member = None,
 ):
+
     if not await require_verified(interaction):
         return
 
     target = member or interaction.user
 
     with db_connect() as conn:
+
         rows = conn.execute("""
             SELECT result_data, created_at
             FROM elo_matches
@@ -1881,16 +1827,26 @@ async def matchhistory_command(
     history = []
 
     for row in rows:
+
         data = json.loads(row["result_data"])
-        result = data.get("changes", {}).get(str(target.id))
+
+        result = data.get(
+            "changes", {}
+        ).get(str(target.id))
 
         if result:
-            outcome = "WIN" if result["won"] else "LOSS"
+
+            outcome = (
+                "WIN" if result["won"]
+                else "LOSS"
+            )
+
             delta = result["delta"]
-            sign = "+" if delta >= 0 else ""
+
+            sign = "+" if delta > 0 else ""
 
             history.append(
-                f"**{outcome}** — {sign}{delta} ELO "
+                f"{outcome} — {sign}{delta} ELO "
                 f"({row['created_at'][:10]})"
             )
 
@@ -1901,105 +1857,108 @@ async def matchhistory_command(
         )
 
     embed = discord.Embed(
-        title=f"꒰ა・{target.display_name}'s {mode.value.upper()} HISTORY",
+        title=f"꒰ა・{target.display_name}'S HISTORY",
         description="\n".join(history[:10]),
         color=discord.Color.from_rgb(255, 160, 200),
     )
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(
+        embed=embed
+    )
 
 
 # ============================================================
 # UNDO MATCH
 # ============================================================
 
-def undo_elo_result(hosting_match_id, guild_id):
+@bot.tree.command(
+    name="undomatch",
+    description="Undo a match's ELO result.",
+)
+@app_commands.describe(
+    match_id="Hosting match ID."
+)
+async def undomatch_command(
+    interaction: discord.Interaction,
+    match_id: int,
+):
+
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(
+            "Only staff can undo results.",
+            ephemeral=True,
+        )
+
     with db_connect() as conn:
+
         row = conn.execute("""
             SELECT *
             FROM elo_matches
-            WHERE hosting_match_id = ? AND guild_id = ?
+            WHERE hosting_match_id = ?
+            AND guild_id = ?
         """, (
-            hosting_match_id,
-            guild_id,
+            match_id,
+            interaction.guild_id,
         )).fetchone()
 
         if not row:
-            raise ValueError("No ELO result exists for that match.")
+            return await interaction.response.send_message(
+                "No ELO result exists for that match.",
+                ephemeral=True,
+            )
 
         data = json.loads(row["result_data"])
-        old_values = data["old_values"]
 
-        for user_id, old in old_values.items():
+        # Prevent restoring stale ratings if later matches changed them.
+        later = conn.execute("""
+            SELECT id
+            FROM elo_matches
+            WHERE guild_id = ?
+            AND mode = ?
+            AND id > ?
+            LIMIT 1
+        """, (
+            interaction.guild_id,
+            row["mode"],
+            row["id"],
+        )).fetchone()
+
+        if later:
+            return await interaction.response.send_message(
+                "A later match has already changed ratings. "
+                "Contact the bot developer before undoing this result.",
+                ephemeral=True,
+            )
+
+        for user_id, old in data["old_values"].items():
+
             conn.execute("""
                 UPDATE ratings
                 SET elo = ?,
                     wins = ?,
                     losses = ?,
                     matches = ?
-                WHERE guild_id = ? AND user_id = ? AND mode = ?
+                WHERE guild_id = ?
+                AND user_id = ?
+                AND mode = ?
             """, (
                 old["elo"],
                 old["wins"],
                 old["losses"],
                 old["matches"],
-                guild_id,
+                interaction.guild_id,
                 int(user_id),
                 row["mode"],
             ))
 
-        conn.execute("""
-            DELETE FROM elo_matches
-            WHERE hosting_match_id = ? AND guild_id = ?
-        """, (
-            hosting_match_id,
-            guild_id,
-        ))
-
-
-@bot.tree.command(
-    name="undomatch",
-    description="Undo a match's ELO result.",
-)
-@app_commands.describe(
-    match_id="The hosting match ID.",
-)
-async def undomatch_command(
-    interaction: discord.Interaction,
-    match_id: int,
-):
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message(
-            "Only tournament staff can undo match results.",
-            ephemeral=True,
+        conn.execute(
+            "DELETE FROM elo_matches WHERE id = ?",
+            (row["id"],),
         )
 
-    match = get_match(match_id)
-
-    if not match:
-        return await interaction.response.send_message(
-            "Match not found.",
-            ephemeral=True,
-        )
-
-    try:
-        undo_elo_result(
-            match_id,
-            interaction.guild_id,
-        )
-
-        update_match_status(match_id, "open")
-
-        await interaction.response.send_message(
-            f"ELO for match `{match_id}` has been undone. "
-            "The match is marked open again."
-        )
-
-    except ValueError as error:
-        await interaction.response.send_message(
-            str(error),
-            ephemeral=True,
-        )
+    await interaction.response.send_message(
+        f"ELO result for match `{match_id}` was undone."
+    )
 
 
 # ============================================================
@@ -2008,28 +1967,28 @@ async def undomatch_command(
 
 @bot.tree.command(
     name="elohelp",
-    description="View ELO commands and rules.",
+    description="View ELO commands.",
 )
 async def elohelp_command(interaction: discord.Interaction):
+
     embed = discord.Embed(
         title="꒰ა・ARSENAL ANGELS ELO HELP",
+        description=(
+            "**Player commands**\n"
+            "`/elo` — Check a player's rating.\n"
+            "`/leaderboard` — View the top 10 players.\n"
+            "`/matchhistory` — View recent match history.\n\n"
+            "**Staff commands**\n"
+            "`/addelo` — Manually add ELO.\n"
+            "`/removeelo` — Manually remove ELO.\n"
+            "`/undomatch` — Undo a match result.\n\n"
+            "**ELO calculation**\n"
+            "70% match result.\n"
+            "20% individual performance.\n"
+            "10% opponent difficulty.\n\n"
+            "Separate ratings for 1v1, 2v2, and 3v3."
+        ),
         color=discord.Color.from_rgb(255, 160, 200),
-    )
-
-    embed.description = (
-        "**Player commands**\n"
-        "`/elo` — View a player's rating.\n"
-        "`/leaderboard` — View the top players.\n"
-        "`/matchhistory` — View recent results.\n\n"
-        "**Staff commands**\n"
-        "`/addelo` — Add ELO manually.\n"
-        "`/removeelo` — Remove ELO manually.\n"
-        "`/undomatch` — Undo a match result.\n\n"
-        "**ELO calculation**\n"
-        "70% match result\n"
-        "20% individual performance\n"
-        "10% opponent difficulty\n\n"
-        "Separate ratings are maintained for 1v1, 2v2, and 3v3."
     )
 
     await interaction.response.send_message(
@@ -2040,32 +1999,26 @@ async def elohelp_command(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="hostinghelp",
-    description="View hosting commands and result instructions.",
+    description="View hosting commands.",
 )
 async def hostinghelp_command(interaction: discord.Interaction):
+
     embed = discord.Embed(
         title="꒰ა・HOSTING HELP",
+        description=(
+            "**Commands**\n"
+            "`/host` — Create a lobby. A private-server link is required.\n"
+            "`/cancel` — Cancel a match by ID.\n"
+            "`/kickplayer` — Remove a player.\n"
+            "`/subplayer` — Replace a player.\n\n"
+            "**Lobby buttons**\n"
+            "Join Host · Leave Host · Post Results · Rehost · Cancel Host\n"
+            "Join Private Server\n\n"
+            "**Results**\n"
+            "Attach a screenshot and list every player with their team "
+            "and points."
+        ),
         color=discord.Color.from_rgb(255, 160, 200),
-    )
-
-    embed.description = (
-        "**Host commands**\n"
-        "`/host` — Create a lobby.\n"
-        "`/kickplayer` — Remove a player.\n"
-        "`/subplayer` — Replace a player.\n\n"
-        "**Lobby buttons**\n"
-        "Join Host — Join the lobby.\n"
-        "Leave Host — Leave the lobby.\n"
-        "Post Results — Submit the match result.\n"
-        "Rehost — Create another lobby.\n"
-        "Cancel Host — Close the lobby.\n\n"
-        "**Submitting results**\n"
-        "Attach a screenshot and list every player:\n"
-        "```text\n"
-        "@player red 32\n"
-        "@player blue 25\n"
-        "```\n"
-        "The bot totals the teams and determines the winner."
     )
 
     await interaction.response.send_message(
@@ -2075,78 +2028,66 @@ async def hostinghelp_command(interaction: discord.Interaction):
 
 
 # ============================================================
-# AUTOMATIC 10-MINUTE LOBBY REMINDERS
+# AUTOMATIC LOBBY REMINDERS
 # ============================================================
 
 @tasks.loop(minutes=1)
 async def lobby_reminders():
-    matches = get_open_matches()
-    current_time = datetime.now(timezone.utc)
 
-    for match in matches:
-        if roster_is_full(match):
+    current = datetime.now(timezone.utc)
+
+    channel = bot.get_channel(HOSTING_CHANNEL_ID)
+
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(
+                HOSTING_CHANNEL_ID
+            )
+        except discord.HTTPException:
+            return
+
+    for match in get_open_matches():
+
+        if is_full(match):
             continue
 
         try:
-            last_reminder = datetime.fromisoformat(
-                match["last_reminder_at"]
+            last = datetime.fromisoformat(
+                match.get("last_reminder_at")
+                or match["created_at"]
             )
 
-            if last_reminder.tzinfo is None:
-                last_reminder = last_reminder.replace(
+            if last.tzinfo is None:
+                last = last.replace(
                     tzinfo=timezone.utc
                 )
 
         except (TypeError, ValueError):
-            last_reminder = datetime.fromisoformat(
-                match["created_at"]
-            )
+            last = current
 
-            if last_reminder.tzinfo is None:
-                last_reminder = last_reminder.replace(
-                    tzinfo=timezone.utc
-                )
-
-        elapsed = (
-            current_time - last_reminder
-        ).total_seconds()
-
-        if elapsed < 600:
+        if (current - last).total_seconds() < 600:
             continue
 
-        channel = bot.get_channel(
-            int(match["channel_id"])
-        )
-
-        if channel is None:
-            try:
-                channel = await bot.fetch_channel(
-                    int(match["channel_id"])
-                )
-            except discord.HTTPException:
-                continue
-
-        role_mention = get_match_role_mention(
-            match["mode"]
-        )
+        count = len(get_roster(match))
 
         try:
+
             await channel.send(
-                f"{role_mention} Match `{match['id']}` "
-                f"is still waiting for players. "
-                f"({len(get_roster(match))}/"
-                f"{get_mode_slots(match['mode'])})"
+                f"{role_mention(match['mode'])} "
+                f"Match `{match['id']}` is waiting for players "
+                f"({count}/{SLOTS[match['mode']]}).",
+                allowed_mentions=discord.AllowedMentions(
+                    roles=True,
+                    users=False,
+                    everyone=False,
+                ),
             )
 
             with db_connect() as conn:
-                conn.execute("""
-                    UPDATE matches
-                    SET last_reminder_at = ?
-                    WHERE id = ?
-                """, (
-                    now_iso(),
-                    match["id"],
-                ))
+                conn.execute(
+                    "UPDATE matches SET last_reminder_at = ? WHERE id = ?",
+                    (now_iso(), match["id"]),
+                )
 
         except discord.HTTPException:
             continue
@@ -2158,22 +2099,16 @@ async def before_lobby_reminders():
 
 
 # ============================================================
-# BOT EVENTS
+# EVENTS
 # ============================================================
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user}.")
+
+    print(f"Logged in as {bot.user}")
 
     if not lobby_reminders.is_running():
         lobby_reminders.start()
-
-
-@bot.event
-async def on_member_join(member):
-    # No automatic verification is granted here.
-    # Your server's verification system should assign the verified role.
-    return
 
 
 # ============================================================
@@ -2182,7 +2117,7 @@ async def on_member_join(member):
 
 if not TOKEN:
     raise RuntimeError(
-        "Missing DISCORD_TOKEN or DISCORD_BOT_TOKEN environment variable."
+        "Set the DISCORD_TOKEN environment variable."
     )
 
 bot.run(TOKEN)
