@@ -94,7 +94,6 @@ def init_db():
                 last_reminder_at TEXT
             )
         """)
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS ratings (
                 guild_id INTEGER NOT NULL,
@@ -108,7 +107,7 @@ def init_db():
             )
         """)
 
-               conn.execute("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS elo_matches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 hosting_match_id INTEGER UNIQUE NOT NULL,
