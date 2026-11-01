@@ -487,10 +487,14 @@ def save_roster(match_id, roster):
             WHERE id = ?
         """, (json.dumps(roster), match_id))
 
-
 def get_roster(match):
+    if not match:
+        return []
+
+    roster_data = match.get("roster", "[]")
+
     try:
-        return json.loads(match["roster"])
+        return json.loads(roster_data)
     except (TypeError, json.JSONDecodeError):
         return []
 
@@ -504,8 +508,16 @@ def match_is_open(match):
 
 
 def roster_is_full(match):
+    if not match:
+        return False
+
     roster = get_roster(match)
-    return len(roster) >= get_mode_slots(match["mode"])
+    required_slots = get_mode_slots(match.get("mode", ""))
+
+    if required_slots == 0:
+        return False
+
+    return len(roster) >= required_slots
 
 
 def member_in_roster(roster, user_id):
