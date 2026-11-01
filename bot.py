@@ -150,6 +150,7 @@ def init_db():
             )
         """)
 
+               # Add missing columns to older databases.
         columns = {
             row[1]
             for row in conn.execute(
@@ -165,6 +166,11 @@ def init_db():
         if "private_server_link" not in columns:
             conn.execute(
                 "ALTER TABLE matches ADD COLUMN private_server_link TEXT"
+            )
+
+        if "last_reminder_at" not in columns:
+            conn.execute(
+                "ALTER TABLE matches ADD COLUMN last_reminder_at TEXT"
             )
 
         conn.commit()
