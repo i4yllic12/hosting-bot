@@ -85,6 +85,7 @@ def db_connect():
     return conn
 
 
+
 def init_db():
     with db_connect() as conn:
         conn.execute("""
@@ -175,6 +176,7 @@ def init_db():
             )
 
         conn.commit()
+
 
 
         # Add the reminder column to older databases if it is missing.
