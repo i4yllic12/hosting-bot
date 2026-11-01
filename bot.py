@@ -583,12 +583,14 @@ def get_match_role_mention(mode):
 # MATCH DATABASE HELPERS
 # ============================================================
 
+
 def create_match(
     guild_id,
     channel_id,
     host_id,
     mode,
     region,
+    private_server_link,
 ):
     created_at = now_iso()
 
@@ -607,9 +609,10 @@ def create_match(
                 status,
                 roster,
                 created_at,
-                last_reminder_at
+                last_reminder_at,
+                private_server_link
             )
-            VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
         """, (
             guild_id,
             channel_id,
@@ -619,9 +622,11 @@ def create_match(
             json.dumps(roster),
             created_at,
             created_at,
+            private_server_link,
         ))
 
         return cursor.lastrowid
+
 
 
 def update_match_status(match_id, status):
@@ -900,10 +905,21 @@ def validate_open_match(match):
 # MATCH VIEW
 # ============================================================
 
+
 class MatchView(discord.ui.View):
-    def __init__(self, match_id):
+    def __init__(self, match_id, private_server_link=None):
         super().__init__(timeout=None)
         self.match_id = match_id
+
+        # Add the private-server button when a link is provided.
+        if private_server_link:
+            self.add_item(
+                discord.ui.Button(
+                    label="Join Private Server",
+                    style=discord.ButtonStyle.link,
+                    url=private_server_link,
+                )
+            )
 
     async def refresh_message(self, interaction):
         match = get_match(self.match_id)
@@ -950,10 +966,7 @@ class MatchView(discord.ui.View):
                 ephemeral=True,
             )
 
-        roster.append({
-            "user_id": interaction.user.id,
-        })
-
+        roster.append({"user_id": interaction.user.id})
         save_roster(self.match_id, roster)
 
         await interaction.response.send_message(
@@ -1061,16 +1074,19 @@ class MatchView(discord.ui.View):
                 ephemeral=True,
             )
 
+        private_server_link = match.get("private_server_link")
+
         new_id = create_match(
             guild_id=match["guild_id"],
             channel_id=match["channel_id"],
             host_id=interaction.user.id,
             mode=match["mode"],
             region=match["region"],
+            private_server_link=private_server_link,
         )
 
         new_match = get_match(new_id)
-        view = MatchView(new_id)
+        view = MatchView(new_id, private_server_link)
 
         message = await interaction.channel.send(
             content=get_match_role_mention(match["mode"]),
@@ -1123,6 +1139,7 @@ class MatchView(discord.ui.View):
             pass
 
 
+
 # ============================================================
 # HOST COMMAND
 # ============================================================
@@ -1148,37 +1165,8 @@ class MatchView(discord.ui.View):
         app_commands.Choice(name="Other", value="Other"),
     ],
 )
-async def host_command(
-    interaction: discord.Interaction,
-    mode: app_commands.Choice[str],
-    region: app_commands.Choice[str],
-):
-    if not await require_verified(interaction):
-        return
 
-    if not await require_host(interaction):
-        return
-
-    match_id = create_match(
-        guild_id=interaction.guild_id,
-        channel_id=interaction.channel_id,
-        host_id=interaction.user.id,
-        mode=mode.value,
-        region=region.value,
-    )
-
-    match = get_match(match_id)
-    view = MatchView(match_id)
-
-    await interaction.response.send_message(
-        content=get_match_role_mention(mode.value),
-        embed=build_match_embed(match),
-        view=view,
-    )
-
-    message = await interaction.original_response()
-    update_match_message(match_id, message.id)
-
+@app_commands.command(name="host", description="Host an Arsenal match")
 @app_commands.describe(
     mode="Choose the match size.",
     region="Choose the region.",
@@ -1190,11 +1178,38 @@ async def host_command(
     region: app_commands.Choice[str],
     private_server_link: str,
 ):
-   if not valid_private_server_link(private_server_link):
-    return await interaction.response.send_message(
-        "Please provide a valid Roblox private-server link.",
-        ephemeral=True,
+    if not await require_verified(interaction):
+        return
+
+    if not await require_host(interaction):
+        return
+
+    if not valid_private_server_link(private_server_link):
+        return await interaction.response.send_message(
+            "Please provide a valid Roblox private-server link.",
+            ephemeral=True,
+        )
+
+    match_id = create_match(
+        guild_id=interaction.guild_id,
+        channel_id=interaction.channel_id,
+        host_id=interaction.user.id,
+        mode=mode.value,
+        region=region.value,
+        private_server_link=private_server_link,
     )
+
+    match = get_match(match_id)
+    view = MatchView(match_id, private_server_link)
+
+    await interaction.response.send_message(
+        content=get_match_role_mention(mode.value),
+        embed=build_match_embed(match),
+        view=view,
+    )
+
+    message = await interaction.original_response()
+    update_match_message(match_id, message.id)
 
 # ============================================================
 # KICK PLAYER
