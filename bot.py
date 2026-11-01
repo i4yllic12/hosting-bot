@@ -1150,6 +1150,23 @@ async def host_command(
     message = await interaction.original_response()
     update_match_message(match_id, message.id)
 
+@app_commands.describe(
+    mode="Choose the match size.",
+    region="Choose the region.",
+    private_server_link="Required Roblox private-server link.",
+)
+async def host_command(
+    interaction: discord.Interaction,
+    mode: app_commands.Choice[str],
+    region: app_commands.Choice[str],
+    private_server_link: str,
+):
+    if not valid_private_server_link(private_server_link):
+    return await interaction.response.send_message(
+        "Please provide a valid Roblox private-server link.",
+        ephemeral=True,
+    )
+
 
 # ============================================================
 # KICK PLAYER
