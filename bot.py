@@ -1161,12 +1161,11 @@ async def host_command(
     region: app_commands.Choice[str],
     private_server_link: str,
 ):
-    if not valid_private_server_link(private_server_link):
+   if not valid_private_server_link(private_server_link):
     return await interaction.response.send_message(
         "Please provide a valid Roblox private-server link.",
         ephemeral=True,
     )
-
 
 # ============================================================
 # KICK PLAYER
