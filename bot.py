@@ -195,15 +195,32 @@ def get_rating(user_id, mode):
 
 def set_rating(user_id, mode, elo):
     with db_connection() as db:
-        db.execute(
+        existing = db.execute(
             """
-            INSERT INTO ratings (user_id, mode, elo)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id, mode)
-            DO UPDATE SET elo = excluded.elo
+            SELECT rowid FROM ratings
+            WHERE user_id = ? AND mode = ?
+            LIMIT 1
             """,
-            (user_id, mode, elo)
-        )
+            (user_id, mode)
+        ).fetchone()
+
+        if existing:
+            db.execute(
+                """
+                UPDATE ratings
+                SET elo = ?
+                WHERE rowid = ?
+                """,
+                (elo, existing["rowid"])
+            )
+        else:
+            db.execute(
+                """
+                INSERT INTO ratings (user_id, mode, elo)
+                VALUES (?, ?, ?)
+                """,
+                (user_id, mode, elo)
+            )
 
 
 def get_roster_ids(match):
