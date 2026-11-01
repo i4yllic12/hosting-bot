@@ -100,7 +100,8 @@ def init_db():
                 roster TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 completed_at TEXT,
-                last_reminder_at TEXT
+                last_reminder_at TEXT,
+                private_server_link TEXT
             )
         """)
 
@@ -150,7 +151,7 @@ def init_db():
             )
         """)
 
-        # Add missing columns to older databases.
+        # Migrate older matches tables.
         columns = {
             row[1]
             for row in conn.execute(
@@ -160,7 +161,7 @@ def init_db():
 
         if "roster" not in columns:
             conn.execute(
-                "ALTER TABLE matches ADD COLUMN roster TEXT DEFAULT '[]'"
+                "ALTER TABLE matches ADD COLUMN roster TEXT NOT NULL DEFAULT '[]'"
             )
 
         if "private_server_link" not in columns:
@@ -174,6 +175,7 @@ def init_db():
             )
 
         conn.commit()
+
 
         # Add the reminder column to older databases if it is missing.
         columns = {
