@@ -729,65 +729,50 @@ class MatchView(discord.ui.View):
         super().__init__(timeout=None)
 
         self.match_id = match_id
-
         match = get_match(match_id)
 
         # Open-match buttons.
         if match and is_open(match):
-            self.add_item(
-                discord.ui.Button(
-                    label="Join Host",
-                    style=discord.ButtonStyle.success,
-                    custom_id=f"aa:join:{match_id}",
-                    callback=self.join_callback,
-                )
+            join_button = discord.ui.Button(
+                label="Join Host",
+                style=discord.ButtonStyle.success,
+                custom_id=f"aa:join:{match_id}",
             )
+            join_button.callback = self.join_callback
+            self.add_item(join_button)
 
-            self.add_item(
-                discord.ui.Button(
-                    label="Leave Host",
-                    style=discord.ButtonStyle.secondary,
-                    custom_id=f"aa:leave:{match_id}",
-                    callback=self.leave_callback,
-                )
+            leave_button = discord.ui.Button(
+                label="Leave Host",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"aa:leave:{match_id}",
             )
+            leave_button.callback = self.leave_callback
+            self.add_item(leave_button)
 
-            self.add_item(
-                discord.ui.Button(
-                    label="Subs",
-                    style=discord.ButtonStyle.primary,
-                    custom_id=f"aa:subs:{match_id}",
-                    callback=self.subs_callback,
-                )
+            subs_button = discord.ui.Button(
+                label="Subs",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"aa:subs:{match_id}",
             )
+            subs_button.callback = self.subs_callback
+            self.add_item(subs_button)
 
-            self.add_item(
-                discord.ui.Button(
-                    label="Post Results",
-                    style=discord.ButtonStyle.primary,
-                    custom_id=f"aa:results:{match_id}",
-                    callback=self.results_callback,
-                )
+            results_button = discord.ui.Button(
+                label="Post Results",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"aa:results:{match_id}",
             )
-
-            self.add_item(
-                discord.ui.Button(
-                    label="Cancel Host",
-                    style=discord.ButtonStyle.danger,
-                    custom_id=f"aa:cancel:{match_id}",
-                    callback=self.cancel_callback,
-                )
-            )
+            results_button.callback = self.results_callback
+            self.add_item(results_button)
 
         # Rehost remains available even after completion/cancellation.
-        self.add_item(
-            discord.ui.Button(
-                label="Rehost",
-                style=discord.ButtonStyle.secondary,
-                custom_id=f"aa:rehost:{match_id}",
-                callback=self.rehost_callback,
-            )
+        rehost_button = discord.ui.Button(
+            label="Rehost",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"aa:rehost:{match_id}",
         )
+        rehost_button.callback = self.rehost_callback
+        self.add_item(rehost_button)
 
         if private_server_link:
             self.add_item(
