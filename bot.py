@@ -1228,7 +1228,6 @@ def calculate_changes(players, scores, guild_id, mode):
 
 
 def apply_result(match_id, guild_id, mode, players, scores):
-
     changes = calculate_changes(
         players,
         scores,
@@ -1239,7 +1238,6 @@ def apply_result(match_id, guild_id, mode, players, scores):
     old_values = {}
 
     with db_connect() as conn:
-
         existing = conn.execute(
             "SELECT id FROM elo_matches WHERE hosting_match_id = ?",
             (match_id,),
@@ -1251,7 +1249,6 @@ def apply_result(match_id, guild_id, mode, players, scores):
             )
 
         for user_id, result in changes.items():
-
             old = ensure_rating(
                 conn,
                 guild_id,
@@ -1295,7 +1292,7 @@ def apply_result(match_id, guild_id, mode, players, scores):
             "winner": winner,
         }
 
-            conn.execute("""
+        conn.execute("""
             INSERT INTO elo_matches
             (hosting_match_id, guild_id, mode, result_data, created_at, winner)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -1307,8 +1304,8 @@ def apply_result(match_id, guild_id, mode, players, scores):
             now_iso(),
             winner,
         ))
-    return changes
 
+    return changes
 
 # ============================================================
 # MATCH RESULT SUBMISSION
