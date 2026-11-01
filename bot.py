@@ -1279,6 +1279,12 @@ def apply_result(match_id, guild_id, mode, players, scores):
                 mode,
             ))
 
+        winner = (
+            "red" if scores["red"] > scores["blue"]
+            else "blue" if scores["blue"] > scores["red"]
+            else "tie"
+        )
+
         data = {
             "old_values": old_values,
             "changes": {
@@ -1286,20 +1292,21 @@ def apply_result(match_id, guild_id, mode, players, scores):
                 for uid, result in changes.items()
             },
             "scores": scores,
+            "winner": winner,
         }
 
-        conn.execute("""
+            conn.execute("""
             INSERT INTO elo_matches
-            (hosting_match_id, guild_id, mode, result_data, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            (hosting_match_id, guild_id, mode, result_data, created_at, winner)
+            VALUES (?, ?, ?, ?, ?, ?)
         """, (
             match_id,
             guild_id,
             mode,
             json.dumps(data),
             now_iso(),
+            winner,
         ))
-
     return changes
 
 
