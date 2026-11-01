@@ -150,6 +150,23 @@ def init_db():
             )
         """)
 
+        columns = {
+    row[1]
+    for row in conn.execute("PRAGMA table_info(matches)").fetchall()
+}
+
+if "roster" not in columns:
+    conn.execute(
+        "ALTER TABLE matches ADD COLUMN roster TEXT DEFAULT '[]'"
+    )
+
+if "private_server_link" not in columns:
+    conn.execute(
+        "ALTER TABLE matches ADD COLUMN private_server_link TEXT"
+    )
+
+conn.commit()
+
         # Add the reminder column to older databases if it is missing.
         columns = {
             row["name"]
