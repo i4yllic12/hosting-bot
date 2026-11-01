@@ -108,7 +108,7 @@ def init_db():
             )
         """)
 
-        conn.execute("""
+               conn.execute("""
             CREATE TABLE IF NOT EXISTS elo_matches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 hosting_match_id INTEGER UNIQUE NOT NULL,
@@ -118,6 +118,19 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
+
+        columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(elo_matches)"
+            ).fetchall()
+        }
+
+        if "result_data" not in columns:
+            conn.execute("""
+                ALTER TABLE elo_matches
+                ADD COLUMN result_data TEXT
+            """)
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS elo_adjustments (
@@ -131,7 +144,6 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
-
         # Migrate older match databases.
         columns = {
             row["name"]
