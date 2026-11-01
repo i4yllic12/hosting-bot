@@ -1,9 +1,9 @@
-
 import os
 import re
 import json
 import sqlite3
 import logging
+
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
 
@@ -37,8 +37,6 @@ DB_PATH = os.getenv("DB_PATH", "./data/hosting.sqlite3")
 
 STARTING_ELO = 1000
 K_FACTOR = 32
-
-MODES = ("1v1s", "2v2s", "3v3s")
 
 SLOTS = {
     "1v1s": 2,
@@ -95,7 +93,6 @@ def table_columns(conn, table):
 
 def init_db():
     with db_connect() as conn:
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS matches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,7 +110,6 @@ def init_db():
             )
         """)
 
-        # Migrate older hosting databases.
         columns = table_columns(conn, "matches")
 
         migrations = {
@@ -145,7 +141,6 @@ def init_db():
             )
         """)
 
-        # Separate table avoids incompatible legacy elo_matches schemas.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS elo_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -240,10 +235,17 @@ def create_match(
     mode,
     region,
     private_server_link,
+    initial_roster=None,
 ):
     created = now_iso()
 
-    roster = [{"user_id": int(host_id)}]
+    if initial_roster is None:
+        roster = [{"user_id": int(host_id)}]
+    else:
+        roster = [
+            {"user_id": int(player["user_id"])}
+            for player in initial_roster
+        ]
 
     with db_connect() as conn:
         cursor = conn.execute("""
@@ -319,6 +321,14 @@ def update_message_id(match_id, message_id):
         )
 
 
+def reset_reminder(match_id):
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE matches SET last_reminder_at = ? WHERE id = ?",
+            (now_iso(), match_id),
+        )
+
+
 def get_roster(match):
     try:
         return json.loads(match.get("roster") or "[]")
@@ -345,40 +355,53 @@ def player_in_roster(roster, user_id):
 
 
 # ============================================================
-# AUTOMATIC OPEN SLOT PING
+# ROLE PINGS
 # ============================================================
 
-async def announce_open_slot(match_id):
+def role_mention(mode):
+    role_id = MATCH_ROLE_IDS.get(mode)
+    return f"<@&{role_id}>" if role_id else ""
+
+
+async def get_hosting_channel():
+    channel = bot.get_channel(HOSTING_CHANNEL_ID)
+
+    if channel is None:
+        channel = await bot.fetch_channel(
+            HOSTING_CHANNEL_ID
+        )
+
+    return channel
+
+
+async def announce_open_slot(match_id, reason):
     match = get_match(match_id)
 
     if not is_open(match) or is_full(match):
         return
 
-    channel = bot.get_channel(HOSTING_CHANNEL_ID)
+    try:
+        channel = await get_hosting_channel()
 
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(
-                HOSTING_CHANNEL_ID
-            )
-        except discord.HTTPException:
-            log.exception("Could not access hosting channel.")
-            return
+        count = len(get_roster(match))
+        needed = SLOTS[match["mode"]] - count
 
-    count = len(get_roster(match))
-    needed = SLOTS[match["mode"]] - count
+        await channel.send(
+            f"{role_mention(match['mode'])} "
+            f"**{reason}!**\n"
+            f"Match `{match_id}` needs **{needed} more player(s)** "
+            f"({count}/{SLOTS[match['mode']]}).",
+            allowed_mentions=discord.AllowedMentions(
+                roles=True,
+                users=False,
+                everyone=False,
+            ),
+        )
 
-    await channel.send(
-        f"{role_mention(match['mode'])} "
-        f"A player has left Match `{match_id}`. "
-        f"We need **{needed} more player(s)**! "
-        f"({count}/{SLOTS[match['mode']]})",
-        allowed_mentions=discord.AllowedMentions(
-            roles=True,
-            users=False,
-            everyone=False,
-        ),
-    )
+        reset_reminder(match_id)
+
+    except discord.HTTPException:
+        log.exception("Could not send open-slot ping.")
 
 
 # ============================================================
@@ -418,11 +441,6 @@ def valid_private_server_link(link):
 # ============================================================
 # MATCH EMBEDS
 # ============================================================
-
-def role_mention(mode):
-    role_id = MATCH_ROLE_IDS.get(mode)
-    return f"<@&{role_id}>" if role_id else ""
-
 
 def make_embed(match):
     roster = get_roster(match)
@@ -483,34 +501,19 @@ async def refresh_match_post(match_id):
     if not match or not match.get("message_id"):
         return
 
-    channel = bot.get_channel(HOSTING_CHANNEL_ID)
-
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(
-                HOSTING_CHANNEL_ID
-            )
-        except discord.HTTPException:
-            log.exception("Could not fetch hosting channel.")
-            return
-
     try:
+        channel = await get_hosting_channel()
+
         message = await channel.fetch_message(
             int(match["message_id"])
         )
 
-        view = (
-            MatchView(
-                match_id,
-                match.get("private_server_link"),
-            )
-            if is_open(match)
-            else None
-        )
-
         await message.edit(
             embed=make_embed(match),
-            view=view,
+            view=MatchView(
+                match_id,
+                match.get("private_server_link"),
+            ),
         )
 
     except discord.HTTPException:
@@ -518,7 +521,206 @@ async def refresh_match_post(match_id):
 
 
 # ============================================================
-# MATCH BUTTONS
+# SUBS DROPDOWN
+# ============================================================
+
+class SubsSelect(discord.ui.Select):
+
+    def __init__(self, match_id, players):
+        self.match_id = match_id
+
+        options = []
+
+        for player in players:
+            user_id = int(player["user_id"])
+
+            options.append(
+                discord.SelectOption(
+                    label=f"Player {user_id}",
+                    description=f"Remove player ID {user_id} from this lobby.",
+                    value=str(user_id),
+                )
+            )
+
+        super().__init__(
+            placeholder="Choose a player to remove...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction):
+        match = get_match(self.match_id)
+
+        if not is_open(match):
+            return await interaction.response.send_message(
+                "This lobby is no longer open.",
+                ephemeral=True,
+            )
+
+        if not can_edit_match(interaction.user, match):
+            return await interaction.response.send_message(
+                "Only the host or staff can remove players.",
+                ephemeral=True,
+            )
+
+        user_id = int(self.values[0])
+        roster = get_roster(match)
+
+        if user_id == int(match["host_id"]):
+            return await interaction.response.send_message(
+                "The host cannot be removed.",
+                ephemeral=True,
+            )
+
+        if not player_in_roster(roster, user_id):
+            return await interaction.response.send_message(
+                "That player is no longer in the lobby.",
+                ephemeral=True,
+            )
+
+        new_roster = [
+            player for player in roster
+            if int(player["user_id"]) != user_id
+        ]
+
+        save_roster(self.match_id, new_roster)
+
+        await interaction.response.send_message(
+            f"<@{user_id}> was removed from Match `{self.match_id}`.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+        await refresh_match_post(self.match_id)
+
+        await announce_open_slot(
+            self.match_id,
+            "A player was removed from the lobby",
+        )
+
+
+class SubsView(discord.ui.View):
+
+    def __init__(self, match_id, players):
+        super().__init__(timeout=60)
+        self.add_item(
+            SubsSelect(match_id, players)
+        )
+
+
+# ============================================================
+# REHOST DROPDOWN
+# ============================================================
+
+class RehostSelect(discord.ui.Select):
+
+    def __init__(self, match_id):
+        self.match_id = match_id
+
+        options = [
+            discord.SelectOption(
+                label="Same Players",
+                description="Create a new lobby with the previous players.",
+                value="same",
+                emoji="👥",
+            ),
+            discord.SelectOption(
+                label="Fresh Lobby",
+                description="Create a new lobby with only the host.",
+                value="fresh",
+                emoji="✨",
+            ),
+        ]
+
+        super().__init__(
+            placeholder="Choose how you want to rehost...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction):
+        match = get_match(self.match_id)
+
+        if not match:
+            return await interaction.response.send_message(
+                "This match could not be found.",
+                ephemeral=True,
+            )
+
+        if not can_edit_match(interaction.user, match):
+            return await interaction.response.send_message(
+                "Only the original host or staff can rehost.",
+                ephemeral=True,
+            )
+
+        choice = self.values[0]
+
+        if choice == "same":
+            roster = get_roster(match)
+            new_host_id = int(match["host_id"])
+
+            if not roster:
+                roster = [{"user_id": new_host_id}]
+
+        else:
+            new_host_id = interaction.user.id
+            roster = [{"user_id": new_host_id}]
+
+        new_id = create_match(
+            guild_id=match["guild_id"],
+            host_id=new_host_id,
+            mode=match["mode"],
+            region=match["region"],
+            private_server_link=match["private_server_link"],
+            initial_roster=roster,
+        )
+
+        new_match = get_match(new_id)
+
+        try:
+            channel = await get_hosting_channel()
+
+            message = await channel.send(
+                content=role_mention(new_match["mode"]),
+                embed=make_embed(new_match),
+                view=MatchView(
+                    new_id,
+                    new_match["private_server_link"],
+                ),
+                allowed_mentions=discord.AllowedMentions(
+                    roles=True,
+                    users=False,
+                    everyone=False,
+                ),
+            )
+
+            update_message_id(new_id, message.id)
+
+        except discord.HTTPException:
+            update_match_status(new_id, "cancelled")
+
+            return await interaction.response.send_message(
+                "I could not create the new lobby. Check my channel permissions.",
+                ephemeral=True,
+            )
+
+        await interaction.response.send_message(
+            f"New lobby created! Match ID: `{new_id}`",
+            ephemeral=True,
+        )
+
+
+class RehostView(discord.ui.View):
+
+    def __init__(self, match_id):
+        super().__init__(timeout=120)
+        self.add_item(RehostSelect(match_id))
+
+
+# ============================================================
+# MATCH VIEW
 # ============================================================
 
 class MatchView(discord.ui.View):
@@ -527,6 +729,65 @@ class MatchView(discord.ui.View):
         super().__init__(timeout=None)
 
         self.match_id = match_id
+
+        match = get_match(match_id)
+
+        # Open-match buttons.
+        if match and is_open(match):
+            self.add_item(
+                discord.ui.Button(
+                    label="Join Host",
+                    style=discord.ButtonStyle.success,
+                    custom_id=f"aa:join:{match_id}",
+                    callback=self.join_callback,
+                )
+            )
+
+            self.add_item(
+                discord.ui.Button(
+                    label="Leave Host",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=f"aa:leave:{match_id}",
+                    callback=self.leave_callback,
+                )
+            )
+
+            self.add_item(
+                discord.ui.Button(
+                    label="Subs",
+                    style=discord.ButtonStyle.primary,
+                    custom_id=f"aa:subs:{match_id}",
+                    callback=self.subs_callback,
+                )
+            )
+
+            self.add_item(
+                discord.ui.Button(
+                    label="Post Results",
+                    style=discord.ButtonStyle.primary,
+                    custom_id=f"aa:results:{match_id}",
+                    callback=self.results_callback,
+                )
+            )
+
+            self.add_item(
+                discord.ui.Button(
+                    label="Cancel Host",
+                    style=discord.ButtonStyle.danger,
+                    custom_id=f"aa:cancel:{match_id}",
+                    callback=self.cancel_callback,
+                )
+            )
+
+        # Rehost remains available even after completion/cancellation.
+        self.add_item(
+            discord.ui.Button(
+                label="Rehost",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"aa:rehost:{match_id}",
+                callback=self.rehost_callback,
+            )
+        )
 
         if private_server_link:
             self.add_item(
@@ -537,26 +798,7 @@ class MatchView(discord.ui.View):
                 )
             )
 
-    async def refresh(self, interaction):
-        match = get_match(self.match_id)
-
-        if not match:
-            return
-
-        await interaction.message.edit(
-            embed=make_embed(match),
-            view=MatchView(
-                self.match_id,
-                match.get("private_server_link"),
-            ),
-        )
-
-    @discord.ui.button(
-        label="Join Host",
-        style=discord.ButtonStyle.success,
-        custom_id="aa:join",
-    )
-    async def join(self, interaction, button):
+    async def join_callback(self, interaction):
         match = get_match(self.match_id)
 
         if not is_open(match):
@@ -576,7 +818,7 @@ class MatchView(discord.ui.View):
                 ephemeral=True,
             )
 
-        if len(roster) >= SLOTS[match["mode"]]:
+        if is_full(match):
             return await interaction.response.send_message(
                 "This lobby is full.",
                 ephemeral=True,
@@ -584,20 +826,16 @@ class MatchView(discord.ui.View):
 
         roster.append({"user_id": interaction.user.id})
         save_roster(self.match_id, roster)
+        reset_reminder(self.match_id)
 
         await interaction.response.send_message(
             "You joined the lobby.",
             ephemeral=True,
         )
 
-        await self.refresh(interaction)
+        await refresh_match_post(self.match_id)
 
-    @discord.ui.button(
-        label="Leave Host",
-        style=discord.ButtonStyle.secondary,
-        custom_id="aa:leave",
-    )
-    async def leave(self, interaction, button):
+    async def leave_callback(self, interaction):
         match = get_match(self.match_id)
 
         if not is_open(match):
@@ -632,17 +870,53 @@ class MatchView(discord.ui.View):
             ephemeral=True,
         )
 
-        await self.refresh(interaction)
+        await refresh_match_post(self.match_id)
 
-        # Ping the mode role when a spot opens.
-        await announce_open_slot(self.match_id)
+        await announce_open_slot(
+            self.match_id,
+            "A player left the lobby",
+        )
 
-    @discord.ui.button(
-        label="Post Results",
-        style=discord.ButtonStyle.primary,
-        custom_id="aa:results",
-    )
-    async def results(self, interaction, button):
+    async def subs_callback(self, interaction):
+        match = get_match(self.match_id)
+
+        if not is_open(match):
+            return await interaction.response.send_message(
+                "This lobby is closed.",
+                ephemeral=True,
+            )
+
+        if not can_edit_match(interaction.user, match):
+            return await interaction.response.send_message(
+                "Only the host or staff can use Subs.",
+                ephemeral=True,
+            )
+
+        roster = get_roster(match)
+
+        removable_players = [
+            player for player in roster
+            if int(player["user_id"]) != int(match["host_id"])
+        ]
+
+        if not removable_players:
+            return await interaction.response.send_message(
+                "There are no players available to remove.",
+                ephemeral=True,
+            )
+
+        view = SubsView(
+            self.match_id,
+            removable_players,
+        )
+
+        await interaction.response.send_message(
+            "Select the player you want to remove:",
+            view=view,
+            ephemeral=True,
+        )
+
+    async def results_callback(self, interaction):
         match = get_match(self.match_id)
 
         if not is_open(match):
@@ -679,70 +953,28 @@ class MatchView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(
-        label="Rehost",
-        style=discord.ButtonStyle.secondary,
-        custom_id="aa:rehost",
-    )
-    async def rehost(self, interaction, button):
+    async def rehost_callback(self, interaction):
         match = get_match(self.match_id)
 
-        if not is_open(match):
+        if not match:
             return await interaction.response.send_message(
-                "This match cannot be rehosted.",
+                "This match could not be found.",
                 ephemeral=True,
             )
 
         if not can_edit_match(interaction.user, match):
             return await interaction.response.send_message(
-                "Only the host or staff can rehost.",
+                "Only the original host or staff can rehost.",
                 ephemeral=True,
             )
 
-        new_id = create_match(
-            match["guild_id"],
-            interaction.user.id,
-            match["mode"],
-            match["region"],
-            match["private_server_link"],
-        )
-
-        new_match = get_match(new_id)
-
-        channel = bot.get_channel(HOSTING_CHANNEL_ID)
-
-        if channel is None:
-            channel = await bot.fetch_channel(
-                HOSTING_CHANNEL_ID
-            )
-
-        message = await channel.send(
-            content=role_mention(match["mode"]),
-            embed=make_embed(new_match),
-            view=MatchView(
-                new_id,
-                match["private_server_link"],
-            ),
-            allowed_mentions=discord.AllowedMentions(
-                roles=True,
-                users=False,
-                everyone=False,
-            ),
-        )
-
-        update_message_id(new_id, message.id)
-
         await interaction.response.send_message(
-            f"New match created. ID: `{new_id}`",
+            "Choose how you want to rehost:",
+            view=RehostView(self.match_id),
             ephemeral=True,
         )
 
-    @discord.ui.button(
-        label="Cancel Host",
-        style=discord.ButtonStyle.danger,
-        custom_id="aa:cancel",
-    )
-    async def cancel(self, interaction, button):
+    async def cancel_callback(self, interaction):
         match = get_match(self.match_id)
 
         if not is_open(match):
@@ -783,15 +1015,21 @@ class ArsenalAngelsBot(commands.Bot):
     async def setup_hook(self):
         init_db()
 
-        for match in get_open_matches():
-            if match.get("message_id"):
-                self.add_view(
-                    MatchView(
-                        match["id"],
-                        match.get("private_server_link"),
-                    ),
-                    message_id=int(match["message_id"]),
-                )
+        with db_connect() as conn:
+            rows = conn.execute("""
+                SELECT id, message_id, private_server_link
+                FROM matches
+                WHERE message_id IS NOT NULL
+            """).fetchall()
+
+        for row in rows:
+            self.add_view(
+                MatchView(
+                    row["id"],
+                    row["private_server_link"],
+                ),
+                message_id=int(row["message_id"]),
+            )
 
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
@@ -856,18 +1094,13 @@ async def host_command(
             ephemeral=True,
         )
 
-    channel = bot.get_channel(HOSTING_CHANNEL_ID)
-
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(
-                HOSTING_CHANNEL_ID
-            )
-        except discord.HTTPException:
-            return await interaction.response.send_message(
-                "I cannot access the hosting channel.",
-                ephemeral=True,
-            )
+    try:
+        channel = await get_hosting_channel()
+    except discord.HTTPException:
+        return await interaction.response.send_message(
+            "I cannot access the hosting channel.",
+            ephemeral=True,
+        )
 
     match_id = create_match(
         interaction.guild_id,
@@ -948,68 +1181,6 @@ async def cancel_command(
 
 
 # ============================================================
-# KICK PLAYER
-# ============================================================
-
-@bot.tree.command(
-    name="kickplayer",
-    description="Remove a player from a lobby.",
-)
-@app_commands.describe(
-    match_id="Match ID.",
-    player="Player to remove.",
-)
-async def kickplayer_command(
-    interaction: discord.Interaction,
-    match_id: int,
-    player: discord.Member,
-):
-    match = get_match(match_id)
-
-    if not is_open(match):
-        return await interaction.response.send_message(
-            "Match is not open.",
-            ephemeral=True,
-        )
-
-    if not can_edit_match(interaction.user, match):
-        return await interaction.response.send_message(
-            "Only the host or staff can kick players.",
-            ephemeral=True,
-        )
-
-    if player.id == int(match["host_id"]):
-        return await interaction.response.send_message(
-            "The host cannot be removed.",
-            ephemeral=True,
-        )
-
-    roster = get_roster(match)
-
-    if not player_in_roster(roster, player.id):
-        return await interaction.response.send_message(
-            "That player is not in the lobby.",
-            ephemeral=True,
-        )
-
-    roster = [
-        p for p in roster
-        if int(p["user_id"]) != player.id
-    ]
-
-    save_roster(match_id, roster)
-    await refresh_match_post(match_id)
-
-    await interaction.response.send_message(
-        f"Removed {player.mention}.",
-        ephemeral=True,
-    )
-
-    # Ping the mode role when a spot opens.
-    await announce_open_slot(match_id)
-
-
-# ============================================================
 # ELO FUNCTIONS
 # ============================================================
 
@@ -1074,8 +1245,13 @@ def calculate_changes(players, scores, guild_id, mode):
     red_average = average(red)
     blue_average = average(blue)
 
-    red_score_average = sum(p["score"] for p in red) / len(red)
-    blue_score_average = sum(p["score"] for p in blue) / len(blue)
+    red_score_average = sum(
+        p["score"] for p in red
+    ) / len(red)
+
+    blue_score_average = sum(
+        p["score"] for p in blue
+    ) / len(blue)
 
     red_won = scores["red"] > scores["blue"]
 
@@ -1086,6 +1262,7 @@ def calculate_changes(players, scores, guild_id, mode):
 
         team_elo = red_average if is_red else blue_average
         opponent_elo = blue_average if is_red else red_average
+
         won = red_won if is_red else not red_won
 
         team_average_score = (
@@ -1109,12 +1286,16 @@ def calculate_changes(players, scores, guild_id, mode):
 
         performance = max(-1, min(1, performance))
 
-        performance_component = 0.20 * K_FACTOR * performance
+        performance_component = (
+            0.20 * K_FACTOR * performance
+        )
 
         difficulty = (opponent_elo - team_elo) / 400
         difficulty = max(-1, min(1, difficulty))
 
-        difficulty_component = 0.10 * K_FACTOR * difficulty
+        difficulty_component = (
+            0.10 * K_FACTOR * difficulty
+        )
 
         delta = round(
             result_component
@@ -1139,7 +1320,6 @@ def calculate_changes(players, scores, guild_id, mode):
 def apply_result(match_id, guild_id, mode, players, scores):
     old_values = {}
 
-    # Calculate and update ratings inside one transaction.
     with db_connect() as conn:
         existing = conn.execute(
             "SELECT id FROM elo_results WHERE hosting_match_id = ?",
@@ -1217,7 +1397,7 @@ def apply_result(match_id, guild_id, mode, players, scores):
 
 
 # ============================================================
-# MATCH RESULT PARSING
+# RESULT PARSING
 # ============================================================
 
 def parse_results(content, roster, mode):
@@ -1300,8 +1480,6 @@ def parse_results(content, roster, mode):
 # ============================================================
 # RESULT SUBMISSION
 # ============================================================
-
-
 
 @bot.event
 async def on_message(message):
@@ -1407,12 +1585,10 @@ async def on_message(message):
             inline=False,
         )
 
-        # Upload the original image as an attachment.
         screenshot_file = await screenshot.to_file(
             filename=screenshot.filename
         )
 
-        # Display the uploaded image in the embed.
         embed.set_image(
             url=f"attachment://{screenshot.filename}"
         )
@@ -1424,19 +1600,16 @@ async def on_message(message):
                 RESULTS_CHANNEL_ID
             )
 
-        # Post the embed and original screenshot.
         await results_channel.send(
             embed=embed,
             file=screenshot_file,
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-        # Mark the match as completed.
         update_match_status(match_id, "completed")
         pending_results.pop(key, None)
 
-        # Delete ONLY the submitted results message.
-        # The original hosting post stays in the channel.
+        # Delete only the submitted results message.
         try:
             await message.delete()
         except discord.HTTPException:
@@ -1444,10 +1617,9 @@ async def on_message(message):
                 "Could not delete the submitted results message."
             )
 
-        # Update the original host post to show completed status.
+        # Keep the original hosting post and its Rehost button.
         await refresh_match_post(match_id)
 
-        # Send confirmation privately.
         try:
             await message.author.send(
                 f"Results for Match `{match_id}` were posted "
@@ -1466,8 +1638,6 @@ async def on_message(message):
         await message.reply(
             "An unexpected error occurred. Check the bot console."
         )
-
-
 
 
 # ============================================================
@@ -1860,6 +2030,9 @@ async def undomatch_command(
         )
 
     update_match_status(match_id, "open")
+    reset_reminder(match_id)
+
+    await refresh_match_post(match_id)
 
     await interaction.response.send_message(
         f"ELO result for match `{match_id}` was undone. "
@@ -1912,17 +2085,23 @@ async def hostinghelp_command(interaction: discord.Interaction):
         description=(
             "**Commands**\n"
             "`/host` — Create a lobby.\n"
-            "`/cancel` — Cancel a match by ID.\n"
-            "`/kickplayer` — Remove a player.\n\n"
+            "`/cancel` — Cancel a match by ID.\n\n"
             "**Lobby buttons**\n"
-            "Join Host · Leave Host · Post Results · Rehost · Cancel Host\n"
-            "Join Private Server\n\n"
-            "**Automatic open slots**\n"
-            "When a player leaves or is kicked, the matching game-mode "
-            "role is pinged in the hosting channel.\n\n"
+            "Join Host · Leave Host · Subs · Post Results · Rehost\n"
+            "Cancel Host · Join Private Server\n\n"
+            "**Subs**\n"
+            "The host or staff can use Subs to select and remove "
+            "a player. The matching game-mode role is then pinged "
+            "to fill the open spot.\n\n"
+            "**Rehosting**\n"
+            "Same Players — Recreate the previous roster.\n"
+            "Fresh Lobby — Start with only the host.\n\n"
+            "**Automatic role pings**\n"
+            "Open lobbies receive a mode-role reminder every "
+            "10 minutes while they need players.\n\n"
             "**Results**\n"
-            "Attach a screenshot and list every player with their team "
-            "and points."
+            "Attach a screenshot and list every player with their "
+            "team and points."
         ),
         color=discord.Color.from_rgb(255, 160, 200),
     )
@@ -1941,16 +2120,11 @@ async def hostinghelp_command(interaction: discord.Interaction):
 async def lobby_reminders():
     current = datetime.now(timezone.utc)
 
-    channel = bot.get_channel(HOSTING_CHANNEL_ID)
-
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(
-                HOSTING_CHANNEL_ID
-            )
-        except discord.HTTPException:
-            log.exception("Could not fetch hosting channel.")
-            return
+    try:
+        channel = await get_hosting_channel()
+    except discord.HTTPException:
+        log.exception("Could not fetch hosting channel.")
+        return
 
     for match in get_open_matches():
         if is_full(match):
@@ -1972,11 +2146,13 @@ async def lobby_reminders():
             continue
 
         count = len(get_roster(match))
+        needed = SLOTS[match["mode"]] - count
 
         try:
             await channel.send(
                 f"{role_mention(match['mode'])} "
-                f"Match `{match['id']}` is waiting for players "
+                f"**Lobby still needs players!**\n"
+                f"Match `{match['id']}` needs **{needed} more player(s)** "
                 f"({count}/{SLOTS[match['mode']]}).",
                 allowed_mentions=discord.AllowedMentions(
                     roles=True,
@@ -1985,14 +2161,13 @@ async def lobby_reminders():
                 ),
             )
 
-            with db_connect() as conn:
-                conn.execute(
-                    "UPDATE matches SET last_reminder_at = ? WHERE id = ?",
-                    (now_iso(), match["id"]),
-                )
+            reset_reminder(match["id"])
 
         except discord.HTTPException:
-            log.exception("Could not send lobby reminder.")
+            log.exception(
+                "Could not send lobby reminder for match %s.",
+                match["id"],
+            )
 
 
 @lobby_reminders.before_loop
