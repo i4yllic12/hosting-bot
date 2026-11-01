@@ -526,24 +526,24 @@ async def refresh_match_post(match_id):
 
 class SubsSelect(discord.ui.Select):
 
-    def __init__(self, match_id, players):
+    def __init__(self, interaction, match_id, players):
         self.match_id = match_id
+        self.interaction = interaction
 
         options = []
 
         for player in players:
             user_id = int(player["user_id"])
+            member = interaction.guild.get_member(user_id)
 
-            member = interaction.guild.get_member(int(user_id))
-
-if member:
-    options.append(
-        discord.SelectOption(
-            label=member.display_name[:100],
-            description=f"Remove {member.name} from this lobby.",
-            value=str(user_id),
-        )
-    )
+            if member:
+                options.append(
+                    discord.SelectOption(
+                        label=member.display_name[:100],
+                        description=f"Remove {member.name} from this lobby.",
+                        value=str(user_id),
+                    )
+                )
 
         super().__init__(
             placeholder="Choose a player to remove...",
