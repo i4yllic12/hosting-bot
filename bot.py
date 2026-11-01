@@ -1302,6 +1302,7 @@ def parse_results(content, roster, mode):
 # ============================================================
 
 
+
 @bot.event
 async def on_message(message):
     if message.author.bot:
@@ -1318,12 +1319,14 @@ async def on_message(message):
 
     if not is_open(match):
         pending_results.pop(key, None)
-        return await message.reply("This match is closed.")
+        await message.reply("This match is closed.")
+        return
 
     if not can_edit_match(message.author, match):
-        return await message.reply(
+        await message.reply(
             "Only the host or staff can submit results."
         )
+        return
 
     screenshot = next(
         (
@@ -1336,9 +1339,10 @@ async def on_message(message):
     )
 
     if screenshot is None:
-        return await message.reply(
+        await message.reply(
             "Please attach an image screenshot."
         )
+        return
 
     try:
         players, scores = parse_results(
@@ -1403,9 +1407,16 @@ async def on_message(message):
             inline=False,
         )
 
-        embed.set_image(url=screenshot.url)
+        # Upload the original image as an attachment.
+        screenshot_file = await screenshot.to_file(
+            filename=screenshot.filename
+        )
 
-        # Find the results channel.
+        # Display the uploaded image in the embed.
+        embed.set_image(
+            url=f"attachment://{screenshot.filename}"
+        )
+
         results_channel = bot.get_channel(RESULTS_CHANNEL_ID)
 
         if results_channel is None:
@@ -1413,39 +1424,19 @@ async def on_message(message):
                 RESULTS_CHANNEL_ID
             )
 
-        # Post the results before deleting the hosting post.
+        # Post the embed and original screenshot.
         await results_channel.send(
             embed=embed,
+            file=screenshot_file,
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-        # Close the match and clear the pending submission.
+        # Mark the match as completed.
         update_match_status(match_id, "completed")
         pending_results.pop(key, None)
 
-        # Delete the original match post from hosting.
-        hosting_channel = bot.get_channel(HOSTING_CHANNEL_ID)
-
-        if hosting_channel is None:
-            hosting_channel = await bot.fetch_channel(
-                HOSTING_CHANNEL_ID
-            )
-
-        if match.get("message_id"):
-            try:
-                host_post = await hosting_channel.fetch_message(
-                    int(match["message_id"])
-                )
-                await host_post.delete()
-            except discord.NotFound:
-                pass
-            except discord.HTTPException:
-                log.exception(
-                    "Could not delete the hosting match post."
-                )
-
-        # Delete the message containing the submitted screenshot
-        # and player scores from the hosting channel.
+        # Delete ONLY the submitted results message.
+        # The original hosting post stays in the channel.
         try:
             await message.delete()
         except discord.HTTPException:
@@ -1453,12 +1444,14 @@ async def on_message(message):
                 "Could not delete the submitted results message."
             )
 
-        # Confirm privately to the person who submitted results.
+        # Update the original host post to show completed status.
+        await refresh_match_post(match_id)
+
+        # Send confirmation privately.
         try:
             await message.author.send(
-                f"Results for Match `{match_id}` were submitted "
-                "successfully. The match post was removed from hosting "
-                "and the results were posted in the results channel."
+                f"Results for Match `{match_id}` were posted "
+                "successfully in the match results channel!"
             )
         except discord.HTTPException:
             pass
@@ -1474,7 +1467,6 @@ async def on_message(message):
             "An unexpected error occurred. Check the bot console."
         )
 
-    await bot.process_commands(message)
 
 
 
