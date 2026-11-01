@@ -150,7 +150,7 @@ def init_db():
             )
         """)
 
-               # Add missing columns to older databases.
+        # Add missing columns to older databases.
         columns = {
             row[1]
             for row in conn.execute(
