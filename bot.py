@@ -1301,6 +1301,7 @@ def parse_results(content, roster, mode):
 # RESULT SUBMISSION
 # ============================================================
 
+
 @bot.event
 async def on_message(message):
     if message.author.bot:
@@ -1362,6 +1363,18 @@ async def on_message(message):
         )
 
         embed.add_field(
+            name="Match ID",
+            value=str(match_id),
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Mode",
+            value=mode.upper(),
+            inline=True,
+        )
+
+        embed.add_field(
             name="Red Team",
             value=str(scores["red"]),
             inline=True,
@@ -1377,8 +1390,11 @@ async def on_message(message):
 
         for user_id, result in changes.items():
             sign = "+" if result["delta"] > 0 else ""
+            outcome = "WIN" if result["won"] else "LOSS"
+
             lines.append(
-                f"<@{user_id}> — {sign}{result['delta']} ELO"
+                f"<@{user_id}> — {outcome} — "
+                f"{sign}{result['delta']} ELO"
             )
 
         embed.add_field(
@@ -1389,25 +1405,63 @@ async def on_message(message):
 
         embed.set_image(url=screenshot.url)
 
-        # Mark completed after the database transaction succeeds.
+        # Find the results channel.
+        results_channel = bot.get_channel(RESULTS_CHANNEL_ID)
+
+        if results_channel is None:
+            results_channel = await bot.fetch_channel(
+                RESULTS_CHANNEL_ID
+            )
+
+        # Post the results before deleting the hosting post.
+        await results_channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+        # Close the match and clear the pending submission.
         update_match_status(match_id, "completed")
         pending_results.pop(key, None)
 
-        if RESULTS_CHANNEL_ID:
-            channel = bot.get_channel(RESULTS_CHANNEL_ID)
+        # Delete the original match post from hosting.
+        hosting_channel = bot.get_channel(HOSTING_CHANNEL_ID)
 
-            if channel is None:
-                channel = await bot.fetch_channel(
-                    RESULTS_CHANNEL_ID
+        if hosting_channel is None:
+            hosting_channel = await bot.fetch_channel(
+                HOSTING_CHANNEL_ID
+            )
+
+        if match.get("message_id"):
+            try:
+                host_post = await hosting_channel.fetch_message(
+                    int(match["message_id"])
+                )
+                await host_post.delete()
+            except discord.NotFound:
+                pass
+            except discord.HTTPException:
+                log.exception(
+                    "Could not delete the hosting match post."
                 )
 
-            await channel.send(embed=embed)
+        # Delete the message containing the submitted screenshot
+        # and player scores from the hosting channel.
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            log.exception(
+                "Could not delete the submitted results message."
+            )
 
-        await message.reply(
-            "Results submitted. ELO has been updated."
-        )
-
-        await refresh_match_post(match_id)
+        # Confirm privately to the person who submitted results.
+        try:
+            await message.author.send(
+                f"Results for Match `{match_id}` were submitted "
+                "successfully. The match post was removed from hosting "
+                "and the results were posted in the results channel."
+            )
+        except discord.HTTPException:
+            pass
 
     except ValueError as error:
         await message.reply(
@@ -1417,10 +1471,11 @@ async def on_message(message):
     except Exception:
         log.exception("Unexpected match-results error.")
         await message.reply(
-            "An unexpected error occurred. Staff can check the bot console."
+            "An unexpected error occurred. Check the bot console."
         )
 
     await bot.process_commands(message)
+
 
 
 # ============================================================
